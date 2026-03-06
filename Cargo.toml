@@ -1,0 +1,18 @@
+[package]
+name = "md_editor"
+version = "0.1.0"
+edition = "2024"
+description = "A simple Markdown editor with live preview, built with Iced"
+license = "MIT"
+rust-version = "1.88"
+
+[dependencies]
+iced = { version = "0.14", features = ["highlighter", "markdown", "tokio"] }
+rfd = { version = "0.17", default-features = false, features = ["gtk3"] }
+tokio = { version = "1", features = ["fs"] }
+webbrowser = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "debuginfo"

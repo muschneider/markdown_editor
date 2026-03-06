@@ -1,0 +1,39 @@
+# Rust
+/target
+Cargo.lock
+
+# Build artifacts
+/dist
+/build
+/out
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Debug/Release binaries
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Profile artifacts
+*.profdata
+*.profraw
+
+# Coverage
+/coverage
+*.lcov
+
+# Misc
+*.log
+.env
+.env.local
+
+# Project specific
+AGENTS.md
+prompts.txt
