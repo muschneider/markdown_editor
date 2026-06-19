@@ -1,7 +1,10 @@
-//! Markdown Editor — a simple side-by-side Markdown editor with live preview.
+//! Markdown Editor — a simple Markdown editor that renders Markdown inline,
+//! showing raw source only on the line being edited.
 
 mod app;
 mod file_ops;
+mod icons;
+mod markdown_view;
 mod theme;
 mod toolbar;
 
@@ -13,6 +16,7 @@ fn main() -> iced::Result {
         MarkdownEditor::update,
         MarkdownEditor::view,
     )
+    .subscription(MarkdownEditor::subscription)
     .theme(MarkdownEditor::theme)
     .title(MarkdownEditor::title)
     .run()

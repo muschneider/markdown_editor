@@ -1,10 +1,11 @@
 //! Formatting toolbar for common Markdown operations.
 
-use iced::Element;
-use iced::widget::{button, container, row, text, tooltip};
+use iced::widget::svg::Handle;
+use iced::widget::{button, container, row, svg, text, tooltip};
+use iced::{Center, Element, Length};
 
 use crate::app::Message;
-use crate::theme;
+use crate::{icons, theme};
 
 /// Markdown formatting actions that can be applied to selected text.
 #[derive(Debug, Clone)]
@@ -46,34 +47,70 @@ impl FormatAction {
     }
 }
 
-/// Build the formatting toolbar as a row of buttons.
+/// Build the formatting toolbar: icon buttons grouped by purpose and divided by
+/// thin separators (inline marks, headings, lists, blocks).
 pub fn view<'a>() -> Element<'a, Message> {
-    let buttons = row![
-        format_button("B", "Bold (Ctrl+B)", FormatAction::Bold),
-        format_button("I", "Italic (Ctrl+I)", FormatAction::Italic),
-        format_button("</>", "Code", FormatAction::InlineCode),
-        format_button("H", "Heading", FormatAction::Heading),
-        format_button("UL", "Bullet List", FormatAction::BulletList),
-        format_button("OL", "Numbered List", FormatAction::NumberedList),
-        format_button(">", "Quote", FormatAction::Quote),
-        format_button("---", "Horizontal Rule", FormatAction::HorizontalRule),
-        format_button("Lnk", "Link", FormatAction::Link),
+    row![
+        format_button(icons::bold(), "Bold", FormatAction::Bold),
+        format_button(icons::italic(), "Italic", FormatAction::Italic),
+        format_button(icons::code(), "Inline Code", FormatAction::InlineCode),
+        separator(),
+        format_button(icons::heading(), "Heading", FormatAction::Heading),
+        separator(),
+        format_button(
+            icons::bullet_list(),
+            "Bullet List",
+            FormatAction::BulletList
+        ),
+        format_button(
+            icons::numbered_list(),
+            "Numbered List",
+            FormatAction::NumberedList
+        ),
+        separator(),
+        format_button(icons::quote(), "Quote", FormatAction::Quote),
+        format_button(
+            icons::horizontal_rule(),
+            "Horizontal Rule",
+            FormatAction::HorizontalRule
+        ),
+        format_button(icons::link(), "Link", FormatAction::Link),
     ]
-    .spacing(4);
-
-    buttons.into()
+    .spacing(4)
+    .align_y(Center)
+    .into()
 }
 
-/// Create a single toolbar button with a tooltip.
-fn format_button<'a>(label: &'a str, tip: &'a str, action: FormatAction) -> Element<'a, Message> {
+/// Create a formatting button that emits a [`Message::Format`].
+fn format_button<'a>(icon: Handle, tip: &'a str, action: FormatAction) -> Element<'a, Message> {
+    icon_button(icon, tip, Message::Format(action))
+}
+
+/// Build an icon-only toolbar button with a tooltip describing its action.
+///
+/// Shared by the formatting toolbar and the file controls in [`crate::app`].
+pub(crate) fn icon_button<'a>(
+    icon: Handle,
+    tip: &'a str,
+    message: Message,
+) -> Element<'a, Message> {
     tooltip(
-        button(text(label).size(13))
-            .padding([4, 8])
+        button(svg(icon).width(18).height(18).style(theme::toolbar_icon))
+            .padding(6)
             .style(theme::toolbar_button)
-            .on_press(Message::Format(action)),
+            .on_press(message),
         tip,
         tooltip::Position::Bottom,
     )
     .style(container::rounded_box)
     .into()
+}
+
+/// A thin vertical divider used to group related toolbar buttons.
+pub(crate) fn separator<'a>() -> Element<'a, Message> {
+    container(text(""))
+        .width(Length::Fixed(1.0))
+        .height(Length::Fixed(22.0))
+        .style(theme::toolbar_separator)
+        .into()
 }
