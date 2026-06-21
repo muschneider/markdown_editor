@@ -113,6 +113,19 @@ const EST_CHARS_PER_LINE: u32 = 90;
 /// few real blocks inside the overscan is far too small to reach the viewport.
 const SCROLL_OVERSCAN_LINES: i64 = 130;
 
+/// Assumed viewport height (px) for the very first frame after a document loads,
+/// before the scrollable has reported its real bounds.
+///
+/// Opening a document used to render *every* line on the first frame (the
+/// viewport was unknown), so all of a large file's code blocks were syntax-
+/// highlighted up front — a multi-hundred-millisecond stall. Instead we assume
+/// the document starts scrolled to the top with roughly a screen's worth of
+/// height; combined with [`SCROLL_OVERSCAN_LINES`] this windows the first frame
+/// to the top of the document. The scrollable reports its true bounds on the
+/// next layout, so any guess error self-corrects within one frame and is hidden
+/// by the overscan regardless.
+const INITIAL_VIEWPORT_HEIGHT: f32 = 1080.0;
+
 /// Main application state.
 pub struct MarkdownEditor {
     /// The document, split into logical lines (no trailing newline characters).
@@ -270,13 +283,17 @@ struct BindingContext {
 }
 
 impl MarkdownEditor {
-    /// Create a new editor instance with default content.
+    /// Create a new editor instance, optionally loading `initial_file` from
+    /// disk instead of showing the welcome document.
     ///
-    /// The per-tag color configuration is loaded from
-    /// `$XDG_CONFIG_HOME/md_editor/config.yaml` (falling back to
-    /// `$HOME/.config/...`) so customizations persist across restarts. Missing
-    /// or malformed config files silently fall back to defaults.
-    pub fn new() -> (Self, Task<Message>) {
+    /// When `initial_file` is `Some`, the editor boots with the welcome
+    /// document and immediately kicks off an async load of the given path;
+    /// [`Message::FileOpened`] swaps in the file's contents on success, or
+    /// leaves the welcome document on error. The per-tag color configuration
+    /// is loaded from `$XDG_CONFIG_HOME/md_editor/config.yaml` (falling back
+    /// to `$HOME/.config/...`) so customizations persist across restarts.
+    /// Missing or malformed config files silently fall back to defaults.
+    pub fn new_with_file(initial_file: Option<PathBuf>) -> (Self, Task<Message>) {
         let mut editor = Self {
             lines: split_lines(WELCOME_MD),
             blocks: Vec::new(),
@@ -301,6 +318,14 @@ impl MarkdownEditor {
         };
         editor.activate_line(0, 0);
         editor.rebuild_blocks();
+
+        if let Some(path) = initial_file {
+            editor.is_loading = true;
+            return (
+                editor,
+                Task::perform(file_ops::load_file(path), Message::FileOpened),
+            );
+        }
 
         (editor, iced::widget::operation::focus(ACTIVE_LINE_ID))
     }
@@ -495,13 +520,20 @@ impl MarkdownEditor {
                 self.is_loading = false;
                 self.is_dirty = false;
 
-                if let Ok((path, contents)) = result {
-                    self.current_file = Some(path);
-                    self.load_document(&contents);
-                    return self.focus_active();
+                match result {
+                    Ok((path, contents)) => {
+                        self.current_file = Some(path);
+                        self.load_document(&contents);
+                        self.focus_active()
+                    }
+                    // A failed read from the command-line argument is worth
+                    // reporting; a cancelled open/save dialog is not.
+                    Err(FileError::IoError(kind)) => {
+                        eprintln!("Error: could not read file: {kind}");
+                        Task::none()
+                    }
+                    Err(FileError::DialogClosed) => Task::none(),
                 }
-
-                Task::none()
             }
             Message::SaveFile => {
                 if self.is_loading {
@@ -786,7 +818,17 @@ impl MarkdownEditor {
                             .on_action(Message::EditorAction)
                             .padding(LINE_PADDING)
                             .font(Font::MONOSPACE)
-                            .highlight("md", highlight_theme)
+                            // Equivalent to the convenience `.highlight("md", …)`,
+                            // spelled out so it works without iced's `highlighter`
+                            // feature (which we drop to stop the Markdown parser
+                            // from eagerly highlighting every code block).
+                            .highlight_with::<iced_highlighter::Highlighter>(
+                                iced_highlighter::Settings {
+                                    theme: highlight_theme,
+                                    token: "md".to_owned(),
+                                },
+                                |highlight, _theme| highlight.to_format(),
+                            )
                             .key_binding(move |key_press| {
                                 if vim_insert {
                                     insert_line_binding(key_press, ctx)
@@ -803,6 +845,9 @@ impl MarkdownEditor {
                         // clear which line the cursor is on.
                         let body: Element<'_, Message> = match &self.active_render {
                             Some(content) => {
+                                if let Some(source) = &self.active_render_source {
+                                    viewer.set_block_source(source.clone());
+                                }
                                 markdown::view_with(content.items(), settings, &viewer)
                                     .map(Message::LinkClicked)
                             }
@@ -850,6 +895,9 @@ impl MarkdownEditor {
                     let element: Element<'_, Message> = if in_window {
                         let body: Element<'_, Message> = match self.blocks.get(block_index) {
                             Some(content) => {
+                                if let Some(source) = self.block_sources.get(block_index) {
+                                    viewer.set_block_source(source.clone());
+                                }
                                 markdown::view_with(content.items(), settings, &viewer)
                                     .map(Message::LinkClicked)
                             }
@@ -1001,10 +1049,14 @@ impl MarkdownEditor {
         self.activate_line(0, 0);
         // Highlighted blocks from the old document are no longer referenced.
         self.code_cache.borrow_mut().clear();
-        // The old scroll offset maps to a different position in the new
-        // document; drop it so the next frame full-renders, after which the
-        // scrollable reports the fresh viewport.
-        self.viewport = None;
+        // A freshly loaded document starts at the top. Seed the viewport with an
+        // assumed top-of-document window (rather than `None`, which renders the
+        // whole document) so the very first frame only builds — and only syntax-
+        // highlights the code blocks of — the lines near the top. Rendering a
+        // large file in full on the first frame highlighted every code block at
+        // once and stalled the open. The scrollable overwrites this with its
+        // real bounds on the next layout.
+        self.viewport = Some((0.0, INITIAL_VIEWPORT_HEIGHT));
         // The old active-region parse is stale.
         self.active_render_source = None;
     }
@@ -1613,7 +1665,7 @@ mod tests {
 
     #[test]
     fn rebuild_blocks_matches_block_segments() {
-        let (mut editor, _task) = MarkdownEditor::new();
+        let (mut editor, _task) = MarkdownEditor::new_with_file(None);
         editor.load_document("# Title\n\n| A | B |\n|---|---|\n| 1 | 2 |");
         editor.rebuild_blocks();
 
@@ -1689,7 +1741,7 @@ mod tests {
         // Simulate a scrolled viewport (as the scrollable would report) and
         // build the view: the windowed path must produce a valid element tree
         // without touching the off-screen blocks.
-        let (mut editor, _t) = MarkdownEditor::new();
+        let (mut editor, _t) = MarkdownEditor::new_with_file(None);
         editor.load_document(
             &(0..2_000)
                 .map(|i| format!("## H{i}\n\nbody\n\n"))
@@ -1730,7 +1782,7 @@ mod tests {
     fn activating_a_table_line_makes_the_whole_table_raw() {
         // This is the bug: clicking the first row of a table used to leave the
         // remaining rows as an invalid, un-renderable table fragment.
-        let (mut editor, _task) = MarkdownEditor::new();
+        let (mut editor, _task) = MarkdownEditor::new_with_file(None);
         editor.load_document("intro\n\n| A | B |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |");
 
         // Click the table's header row.
@@ -1753,7 +1805,7 @@ mod tests {
 
     #[test]
     fn editing_inside_a_table_keeps_the_region_whole() {
-        let (mut editor, _task) = MarkdownEditor::new();
+        let (mut editor, _task) = MarkdownEditor::new_with_file(None);
         editor.load_document("| A | B |\n|---|---|\n| 1 | 2 |");
 
         // The table is active from the start (line 0 is its header).
@@ -1771,7 +1823,7 @@ mod tests {
 
     #[test]
     fn moving_down_into_a_table_selects_the_whole_table() {
-        let (mut editor, _task) = MarkdownEditor::new();
+        let (mut editor, _task) = MarkdownEditor::new_with_file(None);
         editor.load_document("intro\n| A | B |\n|---|---|\n| 1 | 2 |");
 
         // Start on the intro line, then move down into the table.
@@ -1788,7 +1840,7 @@ mod tests {
             .map(|i| format!("line{i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let (mut editor, _task) = MarkdownEditor::new();
+        let (mut editor, _task) = MarkdownEditor::new_with_file(None);
         editor.load_document(&doc);
         assert_eq!((editor.active_start, editor.active_end), (0, 1));
 
@@ -1817,7 +1869,7 @@ mod tests {
 
     #[test]
     fn merge_with_next_joins_the_following_line() {
-        let (mut editor, _task) = MarkdownEditor::new();
+        let (mut editor, _task) = MarkdownEditor::new_with_file(None);
         editor.load_document("foo\nbar\nbaz");
         assert_eq!((editor.active_start, editor.active_end), (0, 1));
 
@@ -1982,7 +2034,7 @@ mod tests {
 
         for (s, doc) in seeds.iter().enumerate() {
             for seed in 0..120u64 {
-                let (mut editor, _t) = MarkdownEditor::new();
+                let (mut editor, _t) = MarkdownEditor::new_with_file(None);
                 editor.load_document(doc);
                 editor.rebuild_blocks();
                 let mut state = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
@@ -2010,7 +2062,7 @@ mod tests {
 
     #[test]
     fn normal_mode_renders_cursor_line_as_markdown() {
-        let (mut editor, _t) = MarkdownEditor::new();
+        let (mut editor, _t) = MarkdownEditor::new_with_file(None);
         editor.load_document("# Title");
         editor.rebuild_blocks();
 
@@ -2026,7 +2078,7 @@ mod tests {
 
     #[test]
     fn entering_insert_shows_raw_editor_instead_of_render() {
-        let (mut editor, _t) = MarkdownEditor::new();
+        let (mut editor, _t) = MarkdownEditor::new_with_file(None);
         editor.load_document("# Title");
         editor.rebuild_blocks();
         assert!(editor.active_render.is_some());
@@ -2043,7 +2095,7 @@ mod tests {
 
     #[test]
     fn leaving_insert_reverts_to_markdown_rendering() {
-        let (mut editor, _t) = MarkdownEditor::new();
+        let (mut editor, _t) = MarkdownEditor::new_with_file(None);
         editor.load_document("# Title");
         editor.rebuild_blocks();
         send_vim(&mut editor, vim::Key::Char('i'));
@@ -2059,7 +2111,7 @@ mod tests {
 
     #[test]
     fn visual_mode_shows_the_raw_editor_for_selection() {
-        let (mut editor, _t) = MarkdownEditor::new();
+        let (mut editor, _t) = MarkdownEditor::new_with_file(None);
         editor.load_document("hello world");
         editor.rebuild_blocks();
 
@@ -2074,13 +2126,13 @@ mod tests {
 
     #[test]
     fn color_panel_is_hidden_by_default() {
-        let (editor, _t) = MarkdownEditor::new();
+        let (editor, _t) = MarkdownEditor::new_with_file(None);
         assert!(!editor.show_color_panel);
     }
 
     #[test]
     fn toggling_color_panel_opens_and_closes() {
-        let (mut editor, _t) = MarkdownEditor::new();
+        let (mut editor, _t) = MarkdownEditor::new_with_file(None);
         let _ = editor.update(Message::ToggleColorPanel);
         assert!(editor.show_color_panel);
         let _ = editor.update(Message::ToggleColorPanel);
@@ -2089,7 +2141,7 @@ mod tests {
 
     #[test]
     fn color_picked_sets_hex_override() {
-        let (mut editor, _t) = MarkdownEditor::new();
+        let (mut editor, _t) = MarkdownEditor::new_with_file(None);
         let red = iced::Color::from_rgb(1.0, 0.0, 0.0);
         let _ = editor.update(Message::ColorPicked(MarkdownTag::H1, red));
         assert_eq!(editor.colors.h1, "#ff0000");
@@ -2097,7 +2149,7 @@ mod tests {
 
     #[test]
     fn color_hex_changed_updates_override() {
-        let (mut editor, _t) = MarkdownEditor::new();
+        let (mut editor, _t) = MarkdownEditor::new_with_file(None);
         let _ = editor.update(Message::ColorHexChanged(
             MarkdownTag::Strong,
             "#00ff00".into(),
@@ -2107,7 +2159,7 @@ mod tests {
 
     #[test]
     fn color_reset_clears_override() {
-        let (mut editor, _t) = MarkdownEditor::new();
+        let (mut editor, _t) = MarkdownEditor::new_with_file(None);
         let _ = editor.update(Message::ColorPicked(
             MarkdownTag::Link,
             iced::Color::from_rgb(0.0, 0.0, 1.0),
@@ -2119,7 +2171,7 @@ mod tests {
 
     #[test]
     fn reset_all_colors_clears_every_override() {
-        let (mut editor, _t) = MarkdownEditor::new();
+        let (mut editor, _t) = MarkdownEditor::new_with_file(None);
         for tag in MarkdownTag::ALL {
             let _ = editor.update(Message::ColorPicked(
                 tag,
@@ -2134,7 +2186,7 @@ mod tests {
 
     #[test]
     fn view_renders_with_color_panel_open() {
-        let (mut editor, _t) = MarkdownEditor::new();
+        let (mut editor, _t) = MarkdownEditor::new_with_file(None);
         editor.load_document(
             "# Title\n\n**bold** and *italic* with `code` and [link](u)\n\n| A | B |\n|---|---|\n| 1 | 2 |",
         );
@@ -2162,7 +2214,7 @@ mod tests {
 
     #[test]
     fn color_changes_do_not_trigger_block_rebuild() {
-        let (mut editor, _t) = MarkdownEditor::new();
+        let (mut editor, _t) = MarkdownEditor::new_with_file(None);
         editor.load_document("# Title\n\nbody");
         editor.rebuild_blocks();
         let before = editor.block_sources.clone();
@@ -2185,7 +2237,7 @@ mod tests {
 
     #[test]
     fn per_level_heading_colors_are_independent() {
-        let (mut editor, _t) = MarkdownEditor::new();
+        let (mut editor, _t) = MarkdownEditor::new_with_file(None);
         // Reset to a known state — `new()` loads from the config file, which
         // may have values from a previous session.
         editor.colors = MarkdownColors::default();
@@ -2209,7 +2261,7 @@ mod tests {
 
     #[test]
     fn table_color_overrides_round_trip() {
-        let (mut editor, _t) = MarkdownEditor::new();
+        let (mut editor, _t) = MarkdownEditor::new_with_file(None);
         // Reset to a known state — `new()` loads from the config file, which
         // may have values from a previous session.
         editor.colors = MarkdownColors::default();
@@ -2242,7 +2294,7 @@ mod tests {
 
     #[test]
     fn diff_rebuild_keeps_block_sources_correct_while_navigating() {
-        let (mut editor, _t) = MarkdownEditor::new();
+        let (mut editor, _t) = MarkdownEditor::new_with_file(None);
         editor.load_document("# A\n\npara one\n\npara two\n\n| H |\n|---|\n| x |\n\nlast");
         editor.rebuild_blocks();
         assert_eq!(editor.block_sources, expected_block_sources(&editor));
@@ -2263,7 +2315,7 @@ mod tests {
 
     #[test]
     fn diff_rebuild_correct_after_structural_edits() {
-        let (mut editor, _t) = MarkdownEditor::new();
+        let (mut editor, _t) = MarkdownEditor::new_with_file(None);
         editor.load_document("alpha\n\nbeta\n\ngamma\n\ndelta");
         editor.rebuild_blocks();
 
@@ -2283,7 +2335,7 @@ mod tests {
 
     #[test]
     fn typing_keeps_blocks_consistent_without_rebuilding() {
-        let (mut editor, _t) = MarkdownEditor::new();
+        let (mut editor, _t) = MarkdownEditor::new_with_file(None);
         editor.load_document("# Title\n\nbody\n\nmore");
         editor.activate_line(2, 0); // "body"
         editor.rebuild_blocks();
@@ -2322,7 +2374,7 @@ mod tests {
             doc.push_str("```rust\nfn main() { let _ = 1 + 1; }\n```\n\n");
         }
 
-        let (mut editor, _t) = MarkdownEditor::new();
+        let (mut editor, _t) = MarkdownEditor::new_with_file(None);
         editor.load_document(&doc);
         editor.rebuild_blocks();
         let lines = editor.lines.len();
@@ -2370,7 +2422,7 @@ mod tests {
             doc.push_str("```rust\nfn main() {{ let _ = 1 + 1; }}\n```\n\n");
         }
 
-        let (mut editor, _t) = MarkdownEditor::new();
+        let (mut editor, _t) = MarkdownEditor::new_with_file(None);
         editor.load_document(&doc);
         editor.rebuild_blocks();
         let lines = editor.lines.len();
@@ -2434,7 +2486,7 @@ mod tests {
             doc.push_str("```rust\nfn main() {{ let _ = 1 + 1; }}\n```\n\n");
         }
 
-        let (mut editor, _t) = MarkdownEditor::new();
+        let (mut editor, _t) = MarkdownEditor::new_with_file(None);
         editor.load_document(&doc);
         editor.rebuild_blocks();
         let lines = editor.lines.len();
@@ -2492,7 +2544,7 @@ mod tests {
         }
         doc.push_str("\ntrailing paragraph\n");
 
-        let (mut editor, _t) = MarkdownEditor::new();
+        let (mut editor, _t) = MarkdownEditor::new_with_file(None);
         editor.load_document(&doc);
         editor.rebuild_blocks();
 
@@ -2553,6 +2605,58 @@ mod tests {
 
     #[test]
     #[ignore = "manual perf measurement: cargo test -- --ignored --nocapture"]
+    fn measure_open_cost_on_a_code_heavy_document() {
+        use std::time::Instant;
+
+        // A code-heavy document in several languages — the worst case for the
+        // open path, which used to syntax-highlight every code block while
+        // *parsing* (work the renderer throws away and redoes per theme). The
+        // parser no longer highlights, so load+rebuild is just pulldown-cmark.
+        let mut doc = String::new();
+        for i in 0..120 {
+            doc.push_str(&format!("## Section {i}\n\n"));
+            doc.push_str("Lorem ipsum dolor sit amet, consectetur adipiscing elit.\n\n");
+            doc.push_str("```rust\nfn main() { let _ = 1 + 1; }\n```\n\n");
+            doc.push_str("```python\ndef f(x):\n    return x + 1\n```\n\n");
+            doc.push_str("```javascript\nconst a = () => 42;\n```\n\n");
+        }
+
+        let (mut editor, _t) = MarkdownEditor::new_with_file(None);
+
+        // "Open" cost: load + first rebuild — exactly what FileOpened does.
+        let t = Instant::now();
+        editor.load_document(&doc);
+        editor.rebuild_blocks();
+        let open = t.elapsed();
+        let lines = editor.lines.len();
+        let blocks = editor.blocks.len();
+
+        // First frame as the app renders it: load_document seeded a top-of-
+        // document viewport, so only the lines near the top are built and
+        // highlighted (not every code block in the file).
+        let t = Instant::now();
+        {
+            let _e = editor.view();
+        }
+        let first_view = t.elapsed();
+
+        // For contrast: rendering the WHOLE document (the old first-frame
+        // behaviour) still pays the cold syntax-highlight of every code block.
+        editor.viewport = None;
+        let t = Instant::now();
+        {
+            let _e = editor.view();
+        }
+        let full_view = t.elapsed();
+
+        println!("[{lines} lines, {blocks} blocks]");
+        println!("  open (load+rebuild):           {open:?}");
+        println!("  first view (windowed to top):  {first_view:?}");
+        println!("  full view (all blocks, forced): {full_view:?}");
+    }
+
+    #[test]
+    #[ignore = "manual perf measurement: cargo test -- --ignored --nocapture"]
     fn bench_rebuild_old_vs_new() {
         use std::time::Instant;
 
@@ -2563,7 +2667,7 @@ mod tests {
             doc.push_str("```rust\nfn main() { let _ = 1 + 1; }\n```\n\n");
         }
 
-        let (mut editor, _t) = MarkdownEditor::new();
+        let (mut editor, _t) = MarkdownEditor::new_with_file(None);
         editor.load_document(&doc);
         let lines = editor.lines.len();
         let positions: Vec<usize> = (0..120).collect();

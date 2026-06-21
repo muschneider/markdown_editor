@@ -34,6 +34,11 @@ Cargo.lock
 .env
 .env.local
 
+# OpenCode
+opencode.json
+opencode.jsonc
+.opencode/
+
 # Project specific
 AGENTS.md
 prompts.txt

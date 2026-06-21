@@ -22,10 +22,13 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use iced::widget::markdown::Uri;
+use iced::alignment;
+use iced::widget::markdown::{self, Uri, Viewer as MarkdownViewer};
+use iced::widget::table;
 use iced::widget::text::Span;
-use iced::widget::{column, container, markdown, rich_text, scrollable, span};
-use iced::{Background, Border, Color, Element, Font, Length, Theme, font, highlighter, padding};
+use iced::widget::{column, container, rich_text, scrollable, span};
+use iced::{Background, Border, Color, Element, Font, Length, Theme, font, padding};
+use iced_highlighter as highlighter;
 
 use crate::theme::MarkdownColors;
 
@@ -84,9 +87,21 @@ pub struct Viewer<'a> {
     /// header cells, then all body cells. So the first `N` content calls (where
     /// `N` = column count) are headers. These cells track that count so
     /// [`Viewer::paragraph`] can style headers differently from body cells.
+    ///
+    /// Only used by the fallback path in [`Viewer::table`]; the primary path
+    /// builds a custom table from [`Viewer::block_source`] and never touches
+    /// these counters.
     in_table: Cell<bool>,
     table_column_count: Cell<usize>,
     content_call_index: Cell<usize>,
+    /// Raw source text of the Markdown block currently being rendered, set by
+    /// the app before calling `markdown::view_with`. [`Viewer::table`] uses it
+    /// to parse table cells directly — `markdown::Row::cells` is private, so
+    /// the library's `markdown::table` is the only other way to access body
+    /// cell content, and it removes vertical column separators and wraps the
+    /// table in a shrink-width scrollable. Parsing from the source lets us
+    /// build a custom `iced::widget::table` with both separators and fill width.
+    block_source: RefCell<Option<String>>,
 }
 
 impl<'a> Viewer<'a> {
@@ -113,6 +128,7 @@ impl<'a> Viewer<'a> {
             in_table: Cell::new(false),
             table_column_count: Cell::new(0),
             content_call_index: Cell::new(0),
+            block_source: RefCell::new(None),
         }
     }
 
@@ -173,6 +189,80 @@ impl<'a> Viewer<'a> {
         self.content_call_index.set(idx + 1);
         idx < self.table_column_count.get()
     }
+
+    /// Set the raw source text of the block currently being rendered.
+    ///
+    /// Must be called before `markdown::view_with` so [`Viewer::table`] can
+    /// parse table cells from the source. The library's `markdown::Row::cells`
+    /// field is private, so without the source we cannot build a custom table
+    /// with column separators and fill width.
+    pub fn set_block_source(&self, source: String) {
+        *self.block_source.borrow_mut() = Some(source);
+    }
+
+    /// Build a custom `iced::widget::table` from the block source, with both
+    /// vertical and horizontal separators and fill width — features the
+    /// library's `markdown::table` does not provide (it sets
+    /// `.separator_x(0)` and wraps in a shrink-width scrollable).
+    ///
+    /// Returns `None` when the source does not contain a parseable table, in
+    /// which case the caller falls back to `markdown::table`.
+    fn build_custom_table(&self, settings: markdown::Settings) -> Option<Element<'a, Uri>> {
+        let source = self.block_source.borrow();
+        let parsed = parse_table_source(source.as_deref()?)?;
+
+        let colors = CellColors {
+            header_text: self.table_header_text,
+            header_bg: self.table_header_background,
+            strong: self.strong,
+            emphasis: self.emphasis,
+        };
+
+        let border_color = self.table_border;
+
+        let columns: Vec<table::Column<'static, 'static, Vec<String>, Uri, Theme, iced::Renderer>> =
+            parsed
+                .alignments
+                .iter()
+                .enumerate()
+                .map(|(i, &align)| {
+                    let header_text = parsed.header_cells.get(i).cloned().unwrap_or_default();
+                    let header = build_cell_element(&header_text, settings, colors, true);
+
+                    table::column(header, move |row: Vec<String>| {
+                        let cell_text = row.get(i).cloned().unwrap_or_default();
+                        build_cell_element(&cell_text, settings, colors, false)
+                    })
+                    .align_x(align)
+                })
+                .collect();
+
+        let table_widget = table::table(columns, parsed.body_rows.clone())
+            .padding_x(settings.spacing.0)
+            .padding_y(settings.spacing.0 / 2.0)
+            .separator_x(1.0)
+            .separator_y(1.0);
+
+        Some(
+            container(
+                scrollable(table_widget)
+                    .direction(scrollable::Direction::Horizontal(
+                        scrollable::Scrollbar::default(),
+                    ))
+                    .width(Length::Fill),
+            )
+            .width(Length::Fill)
+            .style(move |_theme| container::Style {
+                border: Border {
+                    color: border_color,
+                    width: 1.0,
+                    radius: 4.0.into(),
+                },
+                ..Default::default()
+            })
+            .into(),
+        )
+    }
 }
 
 impl<'a> markdown::Viewer<'a, Uri> for Viewer<'a> {
@@ -231,7 +321,11 @@ impl<'a> markdown::Viewer<'a, Uri> for Viewer<'a> {
 
         if is_header {
             // Table header cell: paint spans with the header text color and wrap
-            // in a container with the header background.
+            // in a container with the header background. Keep the cell
+            // content-sized (no `Length::Fill`): `markdown::table` wraps the
+            // table in a horizontal `scrollable` (infinite width) and forces the
+            // first column to Fill, so a Fill header there would blow up to the
+            // scrollable's infinite width and hide every other column.
             let color = self.table_header_text;
             let bg = self.table_header_background;
             let spans = Self::painted(&text.spans(settings.style), color);
@@ -241,7 +335,6 @@ impl<'a> markdown::Viewer<'a, Uri> for Viewer<'a> {
                     .on_link_click(Self::on_link_click)
                     .size(settings.text_size),
             )
-            .width(Length::Fill)
             .style(move |_theme| container::Style {
                 background: Some(Background::Color(bg)),
                 ..Default::default()
@@ -303,8 +396,18 @@ impl<'a> markdown::Viewer<'a, Uri> for Viewer<'a> {
         columns: &'a [markdown::Column],
         rows: &'a [markdown::Row],
     ) -> Element<'a, Uri> {
-        // Set up table-header detection: the first `columns.len()` content calls
-        // through the viewer are header cells, subsequent calls are body cells.
+        // Primary path: build a custom table from the block source with both
+        // vertical and horizontal separators and fill width. The library's
+        // `markdown::table` removes column separators (`.separator_x(0)`) and
+        // wraps in a shrink-width scrollable, which makes tables look
+        // unstructured.
+        if let Some(custom) = self.build_custom_table(settings) {
+            return custom;
+        }
+
+        // Fallback: use the library's table rendering when the block source is
+        // not available. Set up header detection so header cells get distinct
+        // styling.
         self.in_table.set(true);
         self.table_column_count.set(columns.len());
         self.content_call_index.set(0);
@@ -366,4 +469,260 @@ fn highlight(code: &str, language: Option<&str>, theme: highlighter::Theme) -> L
     }
 
     Arc::from(lines)
+}
+
+// -- Custom table rendering ---------------------------------------------------
+
+/// Colors needed to style table cells, extracted from the [`Viewer`] as `Copy`
+/// values so they can be captured by `'static` closures.
+#[derive(Clone, Copy)]
+struct CellColors {
+    header_text: Color,
+    header_bg: Color,
+    strong: Color,
+    emphasis: Color,
+}
+
+/// A table parsed from raw Markdown source text.
+struct ParsedTable {
+    /// Text content of each header cell.
+    header_cells: Vec<String>,
+    /// Horizontal alignment per column.
+    alignments: Vec<alignment::Horizontal>,
+    /// Body rows, each a vector of cell texts.
+    body_rows: Vec<Vec<String>>,
+}
+
+/// Parse a GFM table from raw Markdown `source`.
+///
+/// Scans for a header row followed by a delimiter row (`|---|:--:|---|`), then
+/// collects subsequent table rows as the body. This mirrors the detection in
+/// [`crate::app::table_bounds`] but returns the cell contents so we can build a
+/// custom [`iced::widget::table`] with column separators and fill width —
+/// features the library's `markdown::table` does not provide.
+fn parse_table_source(source: &str) -> Option<ParsedTable> {
+    let lines: Vec<&str> = source.lines().collect();
+
+    // Find the header/delimiter pair: the first line that looks like a table
+    // row immediately followed by a delimiter row.
+    let mut start = None;
+    for i in 0..lines.len().saturating_sub(1) {
+        if is_table_line(lines[i]) && is_delimiter_line(lines[i + 1]) {
+            start = Some(i);
+            break;
+        }
+    }
+    let start = start?;
+
+    let header_cells = split_cells(lines[start]);
+    let alignments = parse_alignments(lines[start + 1]);
+
+    let mut body_rows = Vec::new();
+    for line in lines.iter().skip(start + 2) {
+        if is_table_line(line) {
+            body_rows.push(split_cells(line));
+        } else {
+            break;
+        }
+    }
+
+    Some(ParsedTable {
+        header_cells,
+        alignments,
+        body_rows,
+    })
+}
+
+/// Whether `line` could be a Markdown table row (non-blank, contains a pipe).
+fn is_table_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    !trimmed.is_empty() && trimmed.contains('|')
+}
+
+/// Whether `line` is a GFM table delimiter row (e.g. `|---|:--:|---|`).
+fn is_delimiter_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if !trimmed.contains('|') || !trimmed.contains('-') {
+        return false;
+    }
+    trimmed
+        .chars()
+        .all(|c| matches!(c, '|' | '-' | ':' | ' ' | '\t'))
+}
+
+/// Split a table row into individual cell texts by trimming leading/trailing
+/// pipes and splitting on `|`.
+fn split_cells(line: &str) -> Vec<String> {
+    let trimmed = line.trim();
+    let inner = trimmed.trim_start_matches('|').trim_end_matches('|');
+    inner.split('|').map(|c| c.trim().to_owned()).collect()
+}
+
+/// Parse column alignments from a delimiter row's cells.
+fn parse_alignments(delimiter: &str) -> Vec<alignment::Horizontal> {
+    split_cells(delimiter)
+        .iter()
+        .map(|cell| {
+            let cell = cell.trim();
+            let left = cell.starts_with(':');
+            let right = cell.ends_with(':');
+            match (left, right) {
+                (true, true) => alignment::Horizontal::Center,
+                (false, true) => alignment::Horizontal::Right,
+                _ => alignment::Horizontal::Left,
+            }
+        })
+        .collect()
+}
+
+/// Build a cell [`Element`] from raw cell text, parsing it as Markdown so
+/// inline formatting (bold, italic, code, links) is preserved.
+///
+/// Header cells get a filled background and the header text color; body cells
+/// get bold/italic recoloring like regular paragraphs.
+fn build_cell_element(
+    cell_text: &str,
+    settings: markdown::Settings,
+    colors: CellColors,
+    is_header: bool,
+) -> Element<'static, Uri> {
+    // Parse the cell text as a standalone Markdown document so inline
+    // formatting (bold, italic, code, links) is rendered. The spans returned
+    // by `text.spans` are `'static` (owned), so the `Content` can be dropped
+    // after extraction.
+    let content = markdown::Content::parse(cell_text);
+
+    let spans: Arc<[Span<'static, Uri>]> = content
+        .items()
+        .iter()
+        .find_map(|item| {
+            if let markdown::Item::Paragraph(text) = item {
+                Some(text.spans(settings.style))
+            } else {
+                None
+            }
+        })
+        .unwrap_or_else(|| Arc::from([span(cell_text.to_owned())]));
+
+    if is_header {
+        // Paint all uncolored spans with the header text color.
+        let painted: Vec<Span<'static, Uri>> = spans
+            .iter()
+            .map(|s| {
+                let mut s = s.clone();
+                if s.color.is_none() {
+                    s.color = Some(colors.header_text);
+                }
+                s
+            })
+            .collect();
+
+        // Keep the header cell content-sized (the container defaults to
+        // `Length::Shrink`). A `Length::Fill` cell here breaks the layout: the
+        // table is wrapped in a horizontal `scrollable`, which lays its content
+        // out against an *infinite* max width, and `table::Table::new` forces
+        // the first column to `Length::Fill` when every column is `Shrink`
+        // (which they are). A Fill cell in that first column then expands to the
+        // scrollable's infinite width, pushing all other columns off-screen.
+        // The library's own `markdown::table` avoids this by leaving header
+        // cells `Shrink`, so the forced-Fill column still resolves to its
+        // natural content width — mirror that here.
+        container(
+            rich_text(painted)
+                .on_link_click(Viewer::on_link_click)
+                .size(settings.text_size),
+        )
+        .style(move |_theme| container::Style {
+            background: Some(Background::Color(colors.header_bg)),
+            ..Default::default()
+        })
+        .into()
+    } else {
+        // Recolor bold/italic spans like regular body text.
+        let body: Vec<Span<'static, Uri>> = spans
+            .iter()
+            .map(|s| {
+                let mut s = s.clone();
+                if s.color.is_none()
+                    && let Some(font) = s.font
+                {
+                    if font.weight == font::Weight::Bold {
+                        s.color = Some(colors.strong);
+                    } else if font.style == font::Style::Italic {
+                        s.color = Some(colors.emphasis);
+                    }
+                }
+                s
+            })
+            .collect();
+
+        rich_text(body)
+            .on_link_click(Viewer::on_link_click)
+            .size(settings.text_size)
+            .into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two-column table that previously rendered as a single column must
+    /// parse into *both* columns — header and every body row — so the renderer
+    /// builds a two-column `table::table`. If parsing collapsed to one column,
+    /// the `Descricao` column would be lost before layout ever ran.
+    #[test]
+    fn parse_table_source_recovers_all_columns() {
+        let source = "\
+| Objetivo                  | Descricao                                     |
+|---------------------------|-----------------------------------------------|
+| Encontrar bugs            | Identificar erros logicos antes da producao   |
+| Garantir manutencao       | Codigo legivel e facil de modificar no futuro |
+| Compartilhar conhecimento | Toda a equipe aprende com cada revisao        |";
+
+        let parsed = parse_table_source(source).expect("source contains a table");
+
+        assert_eq!(parsed.header_cells, vec!["Objetivo", "Descricao"]);
+        assert_eq!(
+            parsed.alignments,
+            vec![alignment::Horizontal::Left, alignment::Horizontal::Left]
+        );
+        assert_eq!(parsed.body_rows.len(), 3);
+        // Every row keeps both columns, not just the first.
+        assert!(parsed.body_rows.iter().all(|row| row.len() == 2));
+        assert_eq!(
+            parsed.body_rows[0],
+            vec![
+                "Encontrar bugs".to_owned(),
+                "Identificar erros logicos antes da producao".to_owned(),
+            ]
+        );
+    }
+
+    /// Column alignments come from the delimiter row markers (`:--`, `:-:`, `--:`).
+    #[test]
+    fn parse_alignments_reads_colon_markers() {
+        let parsed = parse_table_source(
+            "\
+| L    | C    | R    |
+| :--- | :--: | ---: |
+| a    | b    | c    |",
+        )
+        .expect("source contains a table");
+
+        assert_eq!(
+            parsed.alignments,
+            vec![
+                alignment::Horizontal::Left,
+                alignment::Horizontal::Center,
+                alignment::Horizontal::Right,
+            ]
+        );
+    }
+
+    /// Text without a header/delimiter pair is not a table.
+    #[test]
+    fn parse_table_source_rejects_non_table() {
+        assert!(parse_table_source("just a paragraph\nwith two lines").is_none());
+    }
 }

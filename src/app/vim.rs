@@ -1702,7 +1702,7 @@ mod tests {
     // -- Engine integration ----------------------------------------------
 
     fn editor_with(text: &str) -> MarkdownEditor {
-        let (mut editor, _task) = MarkdownEditor::new();
+        let (mut editor, _task) = MarkdownEditor::new_with_file(None);
         editor.load_document(text);
         editor.rebuild_blocks();
         editor

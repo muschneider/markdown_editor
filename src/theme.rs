@@ -11,7 +11,8 @@
 //! compose cleanly on top of whichever [`Theme`] is selected.
 
 use iced::widget::{button, container, svg, text};
-use iced::{Background, Border, Color, Theme, highlighter};
+use iced::{Background, Border, Color, Theme};
+use iced_highlighter as highlighter;
 
 /// Background and frame for the editor pane (the rendered document area).
 pub fn editor_pane(theme: &Theme) -> container::Style {

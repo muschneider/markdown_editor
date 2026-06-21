@@ -14,7 +14,14 @@ short_description = "A simple Markdown editor with inline rendering, built with 
 # icon = ["assets/icon.icns"]  # optional; add an .icns for a Dock/Finder icon
 
 [dependencies]
-iced = { version = "0.14", features = ["highlighter", "markdown", "svg", "tokio"] }
+iced = { version = "0.14", features = ["markdown", "svg", "tokio"] }
+# Used directly for our own (theme-correct, cached, windowed) syntax highlighting
+# of code blocks and the active editor line. Depending on it directly — instead
+# of via iced's `highlighter` feature — keeps iced's `markdown` parser from
+# eagerly syntax-highlighting every code block during parsing (with a hardcoded
+# theme we discard and re-highlight anyway), which made opening large documents
+# block for hundreds of milliseconds.
+iced_highlighter = "0.14"
 rfd = { version = "0.17", default-features = false, features = ["gtk3"] }
 tokio = { version = "1", features = ["fs"] }
 webbrowser = "1"
