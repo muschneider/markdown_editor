@@ -25,15 +25,18 @@ use std::sync::Arc;
 
 use iced::keyboard;
 use iced::widget::{
-    Column, column, container, markdown, mouse_area, pick_list, row, scrollable, space, text,
-    text_editor,
+    Column, button, column, container, markdown, mouse_area, pick_list, row, scrollable, space,
+    text, text_editor,
 };
 use iced::{Element, Fill, Font, Subscription, Task, Theme, window};
 
+use crate::color_picker;
+use crate::config;
 use crate::file_ops::{self, FileError};
 use crate::icons;
 use crate::markdown_view;
 use crate::theme as app_theme;
+use crate::theme::{MarkdownColors, MarkdownTag};
 use crate::toolbar::{self, FormatAction};
 
 mod vim;
@@ -90,6 +93,26 @@ const LINE_PADDING: u16 = 4;
 /// Number of lines moved by `PgUp`/`PgDown` (a "page").
 const PAGE_LINES: usize = 15;
 
+/// Rough pixel height of one rendered line, used to turn the scroll offset into
+/// a line range for windowed rendering. Headings are a bit taller, code lines a
+/// bit shorter, and wrapped paragraphs span several visual lines — but
+/// [`estimate_segment_height`] accounts for wrapping and
+/// [`SCROLL_OVERSCAN_LINES`] absorbs the rest, so a placeholder never shows on
+/// screen.
+const EST_LINE_HEIGHT: f32 = 24.0;
+
+/// Approximate characters per rendered line, used to estimate how many visual
+/// lines a source line wraps to. Byte length is used (no UTF-8 decode), which
+/// only ever *over*-estimates for multi-byte text — safe for windowing.
+const EST_CHARS_PER_LINE: u32 = 90;
+
+/// Extra source lines rendered above and below the visible region as real
+/// elements. At 1080 px tall and 24 px/line ≈ 45 visible lines, 130 lines of
+/// overscan is ≈ 3 screens on each side: fast scrolling never reveals a
+/// placeholder before the block is built, and the residual height error of the
+/// few real blocks inside the overscan is far too small to reach the viewport.
+const SCROLL_OVERSCAN_LINES: i64 = 130;
+
 /// Main application state.
 pub struct MarkdownEditor {
     /// The document, split into logical lines (no trailing newline characters).
@@ -122,6 +145,11 @@ pub struct MarkdownEditor {
     is_loading: bool,
     /// The application theme used to render the Markdown preview.
     theme: Theme,
+    /// Per-tag Markdown color overrides. Empty strings follow the theme; valid
+    /// hex strings override a single tag's color.
+    colors: MarkdownColors,
+    /// Whether the per-tag color customization panel is shown.
+    show_color_panel: bool,
     /// Memoized syntax-highlighted code blocks for the current theme. Cleared
     /// when the theme changes or a new document is loaded.
     code_cache: RefCell<markdown_view::CodeCache>,
@@ -129,6 +157,10 @@ pub struct MarkdownEditor {
     /// as raw source; this holds its parsed content. `None` while editing
     /// (Insert) or selecting (Visual), where the raw `text_editor` is shown.
     active_render: Option<markdown::Content>,
+    /// The source text `active_render` was last parsed from, so navigation
+    /// within an unchanged region (e.g. `j`/`k` inside a table) can skip the
+    /// re-parse.
+    active_render_source: Option<String>,
     /// Vim modal-editing state (current mode, pending command, registers, …).
     vim: vim::VimState,
     /// Document snapshots for `u` (undo).
@@ -137,6 +169,13 @@ pub struct MarkdownEditor {
     redo_stack: Vec<vim::Snapshot>,
     /// Set by `:wq`/`:x` so the editor quits once the async save succeeds.
     pending_quit: bool,
+    /// Last reported scroll viewport: `(offset_y, view_height)` in pixels.
+    ///
+    /// `None` until the scrollable's first layout reports it via
+    /// [`Message::Scrolled`], so the first frame (and tests, which never lay
+    /// out a real window) render the whole document — keeping the existing
+    /// behaviour exact for small documents and for the test suite.
+    viewport: Option<(f32, f32)>,
 }
 
 /// All messages the application can handle.
@@ -180,8 +219,23 @@ pub enum Message {
     Format(FormatAction),
     /// Change the theme used to render the Markdown preview.
     ThemeChanged(Theme),
+    /// Toggle the per-tag color customization panel open/closed.
+    ToggleColorPanel,
+    /// The user typed in the hex input for `tag` (may be partial/invalid).
+    ColorHexChanged(MarkdownTag, String),
+    /// The user picked a preset color for `tag`.
+    ColorPicked(MarkdownTag, iced::Color),
+    /// Reset `tag`'s color to the theme default (clear the override).
+    ColorReset(MarkdownTag),
+    /// Reset every tag's color to the theme default.
+    ResetAllColors,
     /// A key routed to the Vim engine (Normal/Visual/command-line modes).
     VimKey(vim::Key),
+    /// The document scroll viewport moved (or was first reported by layout).
+    /// Carries the vertical scroll offset (px from the top) and the visible
+    /// height (px), used to window the rendered blocks so only those near the
+    /// viewport are built into the widget tree.
+    Scrolled { offset_y: f32, view_height: f32 },
 }
 
 /// A renderable piece of the document, derived from the lines and active range.
@@ -217,6 +271,11 @@ struct BindingContext {
 
 impl MarkdownEditor {
     /// Create a new editor instance with default content.
+    ///
+    /// The per-tag color configuration is loaded from
+    /// `$XDG_CONFIG_HOME/md_editor/config.yaml` (falling back to
+    /// `$HOME/.config/...`) so customizations persist across restarts. Missing
+    /// or malformed config files silently fall back to defaults.
     pub fn new() -> (Self, Task<Message>) {
         let mut editor = Self {
             lines: split_lines(WELCOME_MD),
@@ -229,12 +288,16 @@ impl MarkdownEditor {
             is_dirty: false,
             is_loading: false,
             theme: Theme::TokyoNight,
+            colors: config::load(),
+            show_color_panel: false,
             code_cache: RefCell::new(HashMap::new()),
             active_render: None,
+            active_render_source: None,
             vim: vim::VimState::new(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             pending_quit: false,
+            viewport: None,
         };
         editor.activate_line(0, 0);
         editor.rebuild_blocks();
@@ -503,6 +566,38 @@ impl MarkdownEditor {
                 self.code_cache.borrow_mut().clear();
                 Task::none()
             }
+            Message::ToggleColorPanel => {
+                self.show_color_panel = !self.show_color_panel;
+                Task::none()
+            }
+            Message::ColorHexChanged(tag, hex) => {
+                *self.colors.get_mut(tag) = hex;
+                config::save(&self.colors);
+                Task::none()
+            }
+            Message::ColorPicked(tag, color) => {
+                *self.colors.get_mut(tag) = app_theme::to_hex(color);
+                config::save(&self.colors);
+                Task::none()
+            }
+            Message::ColorReset(tag) => {
+                self.colors.get_mut(tag).clear();
+                config::save(&self.colors);
+                Task::none()
+            }
+            Message::ResetAllColors => {
+                self.colors = MarkdownColors::default();
+                config::save(&self.colors);
+                Task::none()
+            }
+            Message::Scrolled {
+                offset_y,
+                view_height,
+            } => {
+                // Pure viewport tracking: no document state changes, no rebuild.
+                self.viewport = Some((offset_y, view_height));
+                Task::none()
+            }
             Message::VimKey(key) => self.handle_vim_key(key),
         }
     }
@@ -520,12 +615,24 @@ impl MarkdownEditor {
 
         let format_bar = toolbar::view();
 
-        // Theme selector, pushed to the right edge of the toolbar.
+        // Theme selector and color customization toggle, pushed to the right
+        // edge of the toolbar.
+        let colors_label = if self.show_color_panel {
+            "Close"
+        } else {
+            "Colors"
+        };
+        let colors_button = button(text(colors_label).size(13))
+            .padding([4, 10])
+            .style(app_theme::toolbar_button)
+            .on_press(Message::ToggleColorPanel);
+
         let theme_picker = row![
             text("Theme").size(13).style(app_theme::status_text),
             pick_list(Theme::ALL, Some(self.theme.clone()), Message::ThemeChanged)
                 .text_size(13)
                 .padding([4, 8]),
+            colors_button,
         ]
         .spacing(8)
         .align_y(iced::Center);
@@ -545,11 +652,66 @@ impl MarkdownEditor {
         .width(Fill)
         .style(app_theme::toolbar_container);
 
+        // -- Per-tag color customization panel (collapsible) --
+        let color_panel: Option<Element<'_, Message>> = if self.show_color_panel {
+            let theme = self.theme();
+            let rows: Vec<Element<'_, Message>> = MarkdownTag::ALL
+                .iter()
+                .map(|&tag| {
+                    let hex = self.colors.get(tag).to_owned();
+                    let effective = match tag {
+                        MarkdownTag::H1 => self.colors.heading_color(1, &theme),
+                        MarkdownTag::H2 => self.colors.heading_color(2, &theme),
+                        MarkdownTag::H3 => self.colors.heading_color(3, &theme),
+                        MarkdownTag::H4 => self.colors.heading_color(4, &theme),
+                        MarkdownTag::H5 => self.colors.heading_color(5, &theme),
+                        MarkdownTag::H6 => self.colors.heading_color(6, &theme),
+                        MarkdownTag::Strong => self.colors.strong_color(&theme),
+                        MarkdownTag::Emphasis => self.colors.emphasis_color(&theme),
+                        MarkdownTag::InlineCode => self.colors.inline_code_color(&theme),
+                        MarkdownTag::InlineCodeBackground => {
+                            self.colors.inline_code_background(&theme)
+                        }
+                        MarkdownTag::Link => self.colors.link_color(&theme),
+                        MarkdownTag::CodeBlockBackground => {
+                            self.colors.code_block_background(&theme)
+                        }
+                        MarkdownTag::TableBorder => self.colors.table_border_color(&theme),
+                        MarkdownTag::TableHeaderBackground => {
+                            self.colors.table_header_background_color(&theme)
+                        }
+                        MarkdownTag::TableHeaderText => self.colors.table_header_text_color(&theme),
+                    };
+                    color_picker::color_row(tag, &hex, effective)
+                })
+                .collect();
+
+            let reset_all = button(text("Reset all to theme").size(12))
+                .padding([4, 10])
+                .style(app_theme::toolbar_button)
+                .on_press(Message::ResetAllColors);
+
+            Some(
+                container(
+                    column(rows)
+                        .spacing(6)
+                        .push(space::vertical().height(4))
+                        .push(reset_all),
+                )
+                .padding([8, 16])
+                .width(Fill)
+                .style(app_theme::toolbar_container)
+                .into(),
+            )
+        } else {
+            None
+        };
+
         // -- Inline document --
         let theme = self.theme();
-        let settings = markdown_view::settings(&theme);
+        let settings = markdown_view::settings(&theme, &self.colors);
         let highlight_theme = app_theme::code_highlighter(&theme);
-        let viewer = markdown_view::Viewer::new(&theme, &self.code_cache);
+        let viewer = markdown_view::Viewer::new(&theme, &self.colors, &self.code_cache);
 
         // Cursor context for the active region's key bindings (computed once).
         let cursor = self.active_content.cursor();
@@ -582,14 +744,40 @@ impl MarkdownEditor {
         // line moves. In a flat list the editor's child index changes whenever
         // you navigate, so iced discards its state and we'd have to re-focus on
         // every key press (an extra full layout pass that pegged the CPU).
+        //
+        // Windowed rendering: for large documents only the segments near the
+        // current scroll viewport are built into the widget tree; everything
+        // else becomes a fixed-height placeholder so the scrollable's content
+        // height (and thus the scroll position) stays stable. Until the
+        // scrollable reports a viewport (first frame, small documents whose
+        // window already covers every line, or tests with no real layout) the
+        // window is `None` and the whole document renders — preserving the
+        // existing behaviour exactly.
+        let window = visible_line_window(self.viewport, self.lines.len());
+
         let mut block_index = 0;
         let mut before: Vec<Element<'_, Message>> = Vec::new();
         let mut after: Vec<Element<'_, Message>> = Vec::new();
         let mut editor_element: Option<Element<'_, Message>> = None;
 
         for segment in segments(&self.lines, self.active_start, self.active_end) {
+            // `is_none_or` short-circuits without running the closure when there
+            // is no viewport, so the per-segment line-range match costs nothing
+            // on the full-render path (small documents, first frame, tests).
+            let in_window = window.is_none_or(|(ws, we)| {
+                let (line_start, line_end) = match &segment {
+                    Segment::Active => (self.active_start, self.active_end),
+                    Segment::Blank(index) => (*index, *index + 1),
+                    Segment::Block { start, end } => (*start, *end),
+                };
+                (line_end as i64) > ws && (line_start as i64) < we
+            });
+
             match segment {
                 Segment::Active => {
+                    // The active region always renders for real: it holds the
+                    // focused editor (and its highlighter cache) and is, by
+                    // definition, where the cursor — hence the viewport — is.
                     let active: Element<'_, Message> = if editor_shows_raw {
                         // Insert/Visual: show the raw Markdown source in the editor.
                         let editor = text_editor(&self.active_content)
@@ -634,15 +822,21 @@ impl MarkdownEditor {
                     );
                 }
                 Segment::Blank(index) => {
-                    // A space keeps the empty line clickable and gives the
-                    // document natural paragraph spacing.
-                    let element: Element<'_, Message> = mouse_area(
-                        container(text(" ").font(Font::MONOSPACE))
-                            .width(Fill)
-                            .padding(LINE_PADDING),
-                    )
-                    .on_press(Message::Activate(index))
-                    .into();
+                    let element: Element<'_, Message> = if in_window {
+                        // A space keeps the empty line clickable and gives the
+                        // document natural paragraph spacing.
+                        mouse_area(
+                            container(text(" ").font(Font::MONOSPACE))
+                                .width(Fill)
+                                .padding(LINE_PADDING),
+                        )
+                        .on_press(Message::Activate(index))
+                        .into()
+                    } else {
+                        // Off-screen: a height-only placeholder keeps the
+                        // scrollable's content height stable.
+                        space::horizontal().height(EST_LINE_HEIGHT).into()
+                    };
 
                     if editor_element.is_some() {
                         after.push(element);
@@ -651,19 +845,30 @@ impl MarkdownEditor {
                     }
                 }
                 Segment::Block { start, end } => {
-                    let body: Element<'_, Message> = match self.blocks.get(block_index) {
-                        Some(content) => markdown::view_with(content.items(), settings, &viewer)
-                            .map(Message::LinkClicked),
-                        // Defensive fallback; `blocks` is kept aligned with the
-                        // segment walk, so this should not happen.
-                        None => text(self.lines[start..end].join("\n")).into(),
-                    };
-                    block_index += 1;
-
-                    let element: Element<'_, Message> =
+                    // `block_index` tracks every Block segment (rendered or not)
+                    // so it stays aligned with `self.blocks`.
+                    let element: Element<'_, Message> = if in_window {
+                        let body: Element<'_, Message> = match self.blocks.get(block_index) {
+                            Some(content) => {
+                                markdown::view_with(content.items(), settings, &viewer)
+                                    .map(Message::LinkClicked)
+                            }
+                            // Defensive fallback; `blocks` is kept aligned with the
+                            // segment walk, so this should not happen.
+                            None => text(self.lines[start..end].join("\n")).into(),
+                        };
                         mouse_area(container(body).width(Fill).padding(LINE_PADDING))
                             .on_press(Message::Activate(start))
-                            .into();
+                            .into()
+                    } else {
+                        // Off-screen: a height-only placeholder keeps the
+                        // scrollable's content height stable so the viewport
+                        // offset keeps mapping to the same document position.
+                        space::horizontal()
+                            .height(estimate_segment_height(&self.lines, start, end))
+                            .into()
+                    };
+                    block_index += 1;
 
                     if editor_element.is_some() {
                         after.push(element);
@@ -691,7 +896,19 @@ impl MarkdownEditor {
                 .width(Fill),
             )
             .width(Fill)
-            .height(Fill),
+            .height(Fill)
+            // Track the viewport so view() can window the rendered blocks.
+            // The callback fires on first layout and whenever the offset
+            // changes (scrolling), but is skipped for redundant viewports, so
+            // typing without scrolling produces no extra messages.
+            .on_scroll(|viewport: scrollable::Viewport| {
+                let offset = viewport.absolute_offset();
+                let bounds = viewport.bounds();
+                Message::Scrolled {
+                    offset_y: offset.y,
+                    view_height: bounds.height,
+                }
+            }),
         )
         .width(Fill)
         .height(Fill)
@@ -747,7 +964,15 @@ impl MarkdownEditor {
         .width(Fill)
         .style(app_theme::toolbar_container);
 
-        column![toolbar, document, status_bar].into()
+        let mut main_column = column![toolbar].spacing(0);
+
+        if let Some(panel) = color_panel {
+            main_column = main_column.push(panel);
+        }
+
+        main_column = main_column.push(document).push(status_bar);
+
+        main_column.into()
     }
 
     /// Return the application theme selected by the user.
@@ -776,6 +1001,12 @@ impl MarkdownEditor {
         self.activate_line(0, 0);
         // Highlighted blocks from the old document are no longer referenced.
         self.code_cache.borrow_mut().clear();
+        // The old scroll offset maps to a different position in the new
+        // document; drop it so the next frame full-renders, after which the
+        // scrollable reports the fresh viewport.
+        self.viewport = None;
+        // The old active-region parse is stale.
+        self.active_render_source = None;
     }
 
     /// Reconstruct the full document text from its lines.
@@ -871,14 +1102,26 @@ impl MarkdownEditor {
 
         // In Normal mode the cursor line is rendered as Markdown, so parse the
         // active region too. It is at most a few lines (a single line, or a whole
-        // table), so a direct parse is cheap. While editing/selecting the raw
-        // editor is shown instead, so skip the work entirely.
-        self.active_render = if self.vim_shows_editor() {
-            None
+        // table), so a direct parse is cheap — but re-parsing on every `j`/`k`
+        // step within a table is wasteful, so the result is cached by source
+        // text and reused when the active region hasn't changed. While
+        // editing/selecting the raw editor is shown instead, so skip entirely.
+        if self.vim_shows_editor() {
+            self.active_render = None;
+            self.active_render_source = None;
         } else {
             let source = self.lines[self.active_start..self.active_end].join("\n");
-            Some(markdown::Content::parse(&source))
-        };
+            let needs_parse = match &self.active_render_source {
+                Some(prev) => prev != &source,
+                None => true,
+            };
+            if needs_parse {
+                self.active_render_source = Some(source);
+                self.active_render = Some(markdown::Content::parse(
+                    self.active_render_source.as_ref().unwrap(),
+                ));
+            }
+        }
     }
 
     /// Make `line` part of the active (raw) region and place the cursor on it.
@@ -886,15 +1129,33 @@ impl MarkdownEditor {
     /// The region expands to a whole table when `line` is inside one (see
     /// [`active_bounds`]); otherwise it covers just that line. The cursor is
     /// placed at `column` (a byte offset, clamped to a char boundary) on `line`.
+    ///
+    /// When the range and text are unchanged (e.g. moving the cursor within a
+    /// table with `j`/`k`), the existing `active_content` is reused and only the
+    /// cursor is moved. Recreating `Content::with_text` on every step resets the
+    /// `text_editor` widget's internal state — including its syntax-highlighter
+    /// cache — forcing a full re-highlight of the entire table on the next
+    /// render. Skipping the recreation keeps table navigation at cursor-speed.
     fn activate_line(&mut self, line: usize, column: usize) {
         let (start, end) = active_bounds(&self.lines, line);
+
+        // If the range hasn't changed, check whether the text is also the same.
+        // `commit_active` keeps `lines` in sync with `active_content` after
+        // edits, and pure motions never touch `lines`, so an unchanged range
+        // with matching text means the content is already correct.
+        let reuse_content = start == self.active_start
+            && end == self.active_end
+            && self.active_content.text() == self.lines[start..end].join("\n");
+
         self.active_start = start;
         self.active_end = end;
-        self.active_content = text_editor::Content::with_text(&self.lines[start..end].join("\n"));
 
         let editor_line = line - start;
         let target_column = clamp_column(&self.lines[line], column);
-        if editor_line > 0 || target_column > 0 {
+
+        if reuse_content {
+            // The content already holds the correct text; just move the cursor.
+            // Always call `move_to` because the cursor is at its old position.
             self.active_content.move_to(text_editor::Cursor {
                 position: text_editor::Position {
                     line: editor_line,
@@ -902,6 +1163,18 @@ impl MarkdownEditor {
                 },
                 selection: None,
             });
+        } else {
+            self.active_content =
+                text_editor::Content::with_text(&self.lines[start..end].join("\n"));
+            if editor_line > 0 || target_column > 0 {
+                self.active_content.move_to(text_editor::Cursor {
+                    position: text_editor::Position {
+                        line: editor_line,
+                        column: target_column,
+                    },
+                    selection: None,
+                });
+            }
         }
     }
 
@@ -955,7 +1228,13 @@ fn message_affects_blocks(message: &Message) -> bool {
         | Message::OpenFile
         | Message::SaveFile
         | Message::FileSaved(_)
-        | Message::ThemeChanged(_) => false,
+        | Message::ThemeChanged(_)
+        | Message::Scrolled { .. }
+        | Message::ToggleColorPanel
+        | Message::ColorHexChanged(_, _)
+        | Message::ColorPicked(_, _)
+        | Message::ColorReset(_)
+        | Message::ResetAllColors => false,
         // A Vim key can edit the document or move the active region (changing
         // which line is shown as raw source), so always rebuild.
         Message::VimKey(_) => true,
@@ -1012,6 +1291,52 @@ fn block_source_eq(lines: &[String], range: (usize, usize), source: &str) -> boo
         }
     }
     parts.next().is_none()
+}
+
+/// Line range to render as real elements, or `None` when the whole document
+/// should be rendered (no viewport yet, or the window already covers every
+/// line). Off-screen segments outside this range become height placeholders in
+/// [`MarkdownEditor::view`] so the scrollable's content height stays stable.
+///
+/// The scroll offset (in content pixels) is mapped to a line index through the
+/// constant [`EST_LINE_HEIGHT`]. This is approximate — headings, code and
+/// wrapped lines deviate — but only the few real blocks *inside* the overscan
+/// contribute their real height to the offset, so the cumulative error at the
+/// viewport is bounded by the overscan and far too small to reach the screen.
+fn visible_line_window(viewport: Option<(f32, f32)>, total_lines: usize) -> Option<(i64, i64)> {
+    let (offset_y, view_height) = viewport?;
+
+    let first = (offset_y / EST_LINE_HEIGHT).floor() as i64;
+    let last = ((offset_y + view_height) / EST_LINE_HEIGHT).ceil() as i64;
+
+    let start = first - SCROLL_OVERSCAN_LINES;
+    let end = last + SCROLL_OVERSCAN_LINES;
+
+    // The window already spans the whole document: render everything and skip
+    // placeholders (keeps small documents on the exact original code path).
+    if start <= 0 && end >= total_lines as i64 {
+        return None;
+    }
+
+    Some((start, end))
+}
+
+/// Estimated pixel height of the block spanning `lines[start..end]`, used for
+/// off-screen placeholders so the scrollable's content height tracks the real
+/// document size.
+///
+/// Each source line is treated as at least one visual line, with extra lines
+/// for wrapping based on byte length (no UTF-8 decode, so multi-byte text only
+/// ever over-estimates — safe for windowing). Headings and code blocks deviate
+/// by a few pixels, absorbed by [`SCROLL_OVERSCAN_LINES`].
+fn estimate_segment_height(lines: &[String], start: usize, end: usize) -> f32 {
+    let mut visual_lines = 0u32;
+    for line in &lines[start..end] {
+        let bytes = line.len() as u32;
+        let wrapped = bytes.div_ceil(EST_CHARS_PER_LINE).max(1);
+        visual_lines += wrapped;
+    }
+    visual_lines as f32 * EST_LINE_HEIGHT
 }
 
 /// Borrow the still-present source text of the `index`-th previous block.
@@ -1299,6 +1624,81 @@ mod tests {
             .count();
 
         assert_eq!(editor.blocks.len(), block_count);
+    }
+
+    // -- Windowed rendering ---------------------------------------------
+    //
+    // `visible_line_window` and `estimate_segment_height` drive the
+    // virtualization in `view`; they are pure functions, so they get their own
+    // unit tests independent of the widget tree.
+
+    #[test]
+    fn visible_line_window_renders_all_without_a_viewport() {
+        // No layout has happened yet (first frame, or tests): render everything
+        // so small documents and the test suite keep the original behaviour.
+        assert_eq!(visible_line_window(None, 10_000), None);
+    }
+
+    #[test]
+    fn visible_line_window_renders_all_when_window_covers_document() {
+        // A small document scrolled to the top: the overscan already reaches
+        // past the end, so there is nothing to skip.
+        assert_eq!(visible_line_window(Some((0.0, 600.0)), 20), None);
+    }
+
+    #[test]
+    fn visible_line_window_crops_a_scrolled_large_document() {
+        // 8 000 lines, scrolled ~halfway down a 1 000 px viewport. The window
+        // must be a bounded line range (not `None`) covering the visible lines.
+        let win = visible_line_window(Some((50_000.0, 1_000.0)), 8_000);
+        let (start, end) = win.expect("a large scrolled document is windowed");
+
+        // offset_y / EST_LINE_HEIGHT ≈ 2 083 → first visible line ~2 083.
+        let first_visible = (50_000.0 / EST_LINE_HEIGHT).floor() as i64;
+        assert!(
+            start <= first_visible && end >= first_visible,
+            "window {start}..{end} must cover the first visible line {first_visible}"
+        );
+        // Overscan reaches past both ends of the visible region.
+        assert!(start < first_visible, "overscan before the viewport");
+        assert!(
+            end > first_visible + (1_000.0 / EST_LINE_HEIGHT) as i64,
+            "overscan after the viewport"
+        );
+    }
+
+    #[test]
+    fn estimate_segment_height_counts_wrapped_lines() {
+        let long = "x".repeat(200); // > EST_CHARS_PER_LINE → ≥3 visual lines
+        let lines = to_lines(&format!("short\n{long}"));
+
+        // One short line (1 visual) + one 200-char line (ceil(200/90) = 3 visual).
+        let h = estimate_segment_height(&lines, 0, 2);
+        assert_eq!(
+            h,
+            (1 + 200u32.div_ceil(EST_CHARS_PER_LINE)) as f32 * EST_LINE_HEIGHT
+        );
+
+        // A single short line is at least one line tall.
+        let h0 = estimate_segment_height(&lines, 0, 1);
+        assert_eq!(h0, EST_LINE_HEIGHT);
+    }
+
+    #[test]
+    fn windowed_view_renders_without_panicking_on_a_large_document() {
+        // Simulate a scrolled viewport (as the scrollable would report) and
+        // build the view: the windowed path must produce a valid element tree
+        // without touching the off-screen blocks.
+        let (mut editor, _t) = MarkdownEditor::new();
+        editor.load_document(
+            &(0..2_000)
+                .map(|i| format!("## H{i}\n\nbody\n\n"))
+                .collect::<String>(),
+        );
+        editor.rebuild_blocks();
+        editor.viewport = Some((8_000.0, 800.0));
+
+        let _element = editor.view();
     }
 
     #[test]
@@ -1670,6 +2070,162 @@ mod tests {
         assert!(editor.active_render.is_none());
     }
 
+    // -- Per-tag color customization -----------------------------------
+
+    #[test]
+    fn color_panel_is_hidden_by_default() {
+        let (editor, _t) = MarkdownEditor::new();
+        assert!(!editor.show_color_panel);
+    }
+
+    #[test]
+    fn toggling_color_panel_opens_and_closes() {
+        let (mut editor, _t) = MarkdownEditor::new();
+        let _ = editor.update(Message::ToggleColorPanel);
+        assert!(editor.show_color_panel);
+        let _ = editor.update(Message::ToggleColorPanel);
+        assert!(!editor.show_color_panel);
+    }
+
+    #[test]
+    fn color_picked_sets_hex_override() {
+        let (mut editor, _t) = MarkdownEditor::new();
+        let red = iced::Color::from_rgb(1.0, 0.0, 0.0);
+        let _ = editor.update(Message::ColorPicked(MarkdownTag::H1, red));
+        assert_eq!(editor.colors.h1, "#ff0000");
+    }
+
+    #[test]
+    fn color_hex_changed_updates_override() {
+        let (mut editor, _t) = MarkdownEditor::new();
+        let _ = editor.update(Message::ColorHexChanged(
+            MarkdownTag::Strong,
+            "#00ff00".into(),
+        ));
+        assert_eq!(editor.colors.strong, "#00ff00");
+    }
+
+    #[test]
+    fn color_reset_clears_override() {
+        let (mut editor, _t) = MarkdownEditor::new();
+        let _ = editor.update(Message::ColorPicked(
+            MarkdownTag::Link,
+            iced::Color::from_rgb(0.0, 0.0, 1.0),
+        ));
+        assert!(!editor.colors.link.is_empty());
+        let _ = editor.update(Message::ColorReset(MarkdownTag::Link));
+        assert!(editor.colors.link.is_empty());
+    }
+
+    #[test]
+    fn reset_all_colors_clears_every_override() {
+        let (mut editor, _t) = MarkdownEditor::new();
+        for tag in MarkdownTag::ALL {
+            let _ = editor.update(Message::ColorPicked(
+                tag,
+                iced::Color::from_rgb(0.5, 0.5, 0.5),
+            ));
+        }
+        let _ = editor.update(Message::ResetAllColors);
+        for tag in MarkdownTag::ALL {
+            assert!(editor.colors.get(tag).is_empty(), "{tag:?} not cleared");
+        }
+    }
+
+    #[test]
+    fn view_renders_with_color_panel_open() {
+        let (mut editor, _t) = MarkdownEditor::new();
+        editor.load_document(
+            "# Title\n\n**bold** and *italic* with `code` and [link](u)\n\n| A | B |\n|---|---|\n| 1 | 2 |",
+        );
+        editor.rebuild_blocks();
+        let _ = editor.update(Message::ToggleColorPanel);
+        // Setting a few overrides and building the view must not panic.
+        let _ = editor.update(Message::ColorPicked(
+            MarkdownTag::H1,
+            iced::Color::from_rgb(1.0, 0.3, 0.3),
+        ));
+        let _ = editor.update(Message::ColorHexChanged(
+            MarkdownTag::InlineCode,
+            "#abcdef".into(),
+        ));
+        let _ = editor.update(Message::ColorPicked(
+            MarkdownTag::TableBorder,
+            iced::Color::from_rgb(0.5, 0.5, 0.5),
+        ));
+        let _ = editor.update(Message::ColorPicked(
+            MarkdownTag::TableHeaderBackground,
+            iced::Color::from_rgb(0.2, 0.2, 0.3),
+        ));
+        let _element = editor.view();
+    }
+
+    #[test]
+    fn color_changes_do_not_trigger_block_rebuild() {
+        let (mut editor, _t) = MarkdownEditor::new();
+        editor.load_document("# Title\n\nbody");
+        editor.rebuild_blocks();
+        let before = editor.block_sources.clone();
+
+        // Color messages are pure render-time changes; they must not rebuild.
+        let _ = editor.update(Message::ColorPicked(
+            MarkdownTag::H1,
+            iced::Color::from_rgb(1.0, 0.0, 0.0),
+        ));
+        let _ = editor.update(Message::ColorHexChanged(
+            MarkdownTag::Strong,
+            "#00ff00".into(),
+        ));
+        let _ = editor.update(Message::ColorReset(MarkdownTag::H1));
+        let _ = editor.update(Message::ResetAllColors);
+        let _ = editor.update(Message::ToggleColorPanel);
+
+        assert_eq!(editor.block_sources, before);
+    }
+
+    #[test]
+    fn per_level_heading_colors_are_independent() {
+        let (mut editor, _t) = MarkdownEditor::new();
+        // Reset to a known state — `new()` loads from the config file, which
+        // may have values from a previous session.
+        editor.colors = MarkdownColors::default();
+        let _ = editor.update(Message::ColorPicked(
+            MarkdownTag::H1,
+            iced::Color::from_rgb(1.0, 0.0, 0.0),
+        ));
+        let _ = editor.update(Message::ColorPicked(
+            MarkdownTag::H2,
+            iced::Color::from_rgb(0.0, 1.0, 0.0),
+        ));
+        // H1 and H2 have independent overrides; H3 is still empty.
+        assert_eq!(editor.colors.h1, "#ff0000");
+        assert_eq!(editor.colors.h2, "#00ff00");
+        assert!(editor.colors.h3.is_empty());
+        // Resetting H1 does not affect H2.
+        let _ = editor.update(Message::ColorReset(MarkdownTag::H1));
+        assert!(editor.colors.h1.is_empty());
+        assert_eq!(editor.colors.h2, "#00ff00");
+    }
+
+    #[test]
+    fn table_color_overrides_round_trip() {
+        let (mut editor, _t) = MarkdownEditor::new();
+        // Reset to a known state — `new()` loads from the config file, which
+        // may have values from a previous session.
+        editor.colors = MarkdownColors::default();
+        let _ = editor.update(Message::ColorPicked(
+            MarkdownTag::TableBorder,
+            iced::Color::from_rgb(0.1, 0.2, 0.3),
+        ));
+        let _ = editor.update(Message::ColorHexChanged(
+            MarkdownTag::TableHeaderText,
+            "#ffaa00".into(),
+        ));
+        assert_eq!(editor.colors.table_border, "#1a334d");
+        assert_eq!(editor.colors.table_header_text, "#ffaa00");
+        assert!(editor.colors.table_header_background.is_empty());
+    }
+
     // -- Incremental block rebuild --------------------------------------
 
     /// The block sources a *full* rebuild would produce, used as the ground
@@ -1799,6 +2355,168 @@ mod tests {
             "  typing update:      {typing:?} total, {:?}/step",
             typing / type_steps
         );
+    }
+
+    #[test]
+    #[ignore = "manual perf measurement: cargo test -- --ignored --nocapture"]
+    fn measure_view_cost_on_a_large_document() {
+        use std::time::Instant;
+
+        // ~6,000 lines: headings, paragraphs and fenced code blocks.
+        let mut doc = String::new();
+        for i in 0..1000 {
+            doc.push_str(&format!("## Section {i}\n\n"));
+            doc.push_str("Lorem ipsum dolor sit amet, consectetur adipiscing elit.\n\n");
+            doc.push_str("```rust\nfn main() {{ let _ = 1 + 1; }}\n```\n\n");
+        }
+
+        let (mut editor, _t) = MarkdownEditor::new();
+        editor.load_document(&doc);
+        editor.rebuild_blocks();
+        let lines = editor.lines.len();
+
+        // view() while typing in Insert mode (rebuild skipped, but view runs
+        // every frame): the realistic per-keystroke cost the user feels.
+        send_vim(&mut editor, vim::Key::Char('i'));
+        let view_steps = 200;
+        let t = Instant::now();
+        for _ in 0..view_steps {
+            let _ = editor.update(Message::EditorAction(text_editor::Action::Edit(
+                text_editor::Edit::Insert('a'),
+            )));
+            let _element = editor.view();
+        }
+        let typing_view = t.elapsed();
+
+        // view() while navigating in Normal mode (rebuild + view each step).
+        send_vim(&mut editor, vim::Key::Esc);
+        let nav_view_steps = 200;
+        let t = Instant::now();
+        for _ in 0..nav_view_steps {
+            let _ = editor.update(Message::MoveDown);
+            let _element = editor.view();
+        }
+        let nav_view = t.elapsed();
+
+        // Pure view() cost (no state change) — what scrolling pays per frame.
+        let pure_view_steps = 200;
+        let t = Instant::now();
+        for _ in 0..pure_view_steps {
+            let _element = editor.view();
+        }
+        let pure_view = t.elapsed();
+
+        println!("[{lines} lines]");
+        println!(
+            "  typing + view:  {typing_view:?} total, {:?}/step",
+            typing_view / view_steps
+        );
+        println!(
+            "  nav + view:     {nav_view:?} total, {:?}/step",
+            nav_view / nav_view_steps
+        );
+        println!(
+            "  pure view:      {pure_view:?} total, {:?}/step",
+            pure_view / pure_view_steps
+        );
+    }
+
+    #[test]
+    #[ignore = "manual perf measurement: cargo test -- --ignored --nocapture"]
+    fn measure_windowed_view_speedup_on_a_large_document() {
+        use std::time::Instant;
+
+        // ~6,000 lines: headings, paragraphs and fenced code blocks.
+        let mut doc = String::new();
+        for i in 0..1000 {
+            doc.push_str(&format!("## Section {i}\n\n"));
+            doc.push_str("Lorem ipsum dolor sit amet, consectetur adipiscing elit.\n\n");
+            doc.push_str("```rust\nfn main() {{ let _ = 1 + 1; }}\n```\n\n");
+        }
+
+        let (mut editor, _t) = MarkdownEditor::new();
+        editor.load_document(&doc);
+        editor.rebuild_blocks();
+        let lines = editor.lines.len();
+        send_vim(&mut editor, vim::Key::Char('i'));
+
+        // FULL render: no viewport reported yet (first frame / tests).
+        editor.viewport = None;
+        let steps = 300;
+        let t = Instant::now();
+        for _ in 0..steps {
+            let _ = editor.update(Message::EditorAction(text_editor::Action::Edit(
+                text_editor::Edit::Insert('a'),
+            )));
+            let _element = editor.view();
+        }
+        let full = t.elapsed();
+
+        // WINDOWED render: viewport reported around the middle of the document
+        // (where the cursor is), as the scrollable would after first layout.
+        editor.viewport = Some((40_000.0, 1_000.0));
+        let t = Instant::now();
+        for _ in 0..steps {
+            let _ = editor.update(Message::EditorAction(text_editor::Action::Edit(
+                text_editor::Edit::Insert('a'),
+            )));
+            let _element = editor.view();
+        }
+        let windowed = t.elapsed();
+
+        println!("[{lines} lines]");
+        println!("  full render:     {full:?} total, {:?}/step", full / steps);
+        println!(
+            "  windowed render: {windowed:?} total, {:?}/step",
+            windowed / steps
+        );
+        println!(
+            "  speedup: {:.1}x",
+            full.as_secs_f64() / windowed.as_secs_f64()
+        );
+    }
+
+    #[test]
+    #[ignore = "manual perf measurement: cargo test -- --ignored --nocapture"]
+    fn measure_table_navigation_cost() {
+        use std::time::Instant;
+
+        // A document with a 20-row table — exercises the worst case for
+        // navigation: the active region spans the whole table, so every j/k
+        // recreates the editor content and re-parses the table as Markdown.
+        let mut doc = String::from("intro line\n\n");
+        doc.push_str("| Col A | Col B | Col C |\n");
+        doc.push_str("|-------|-------|-------|\n");
+        for i in 0..20 {
+            doc.push_str(&format!("| a{i} | b{i} | c{i} |\n"));
+        }
+        doc.push_str("\ntrailing paragraph\n");
+
+        let (mut editor, _t) = MarkdownEditor::new();
+        editor.load_document(&doc);
+        editor.rebuild_blocks();
+
+        // Navigate DOWN into and through the table (Normal mode, so each step
+        // also re-parses active_render).
+        let steps = 30;
+        let t = Instant::now();
+        for _ in 0..steps {
+            let _ = editor.update(Message::VimKey(vim::Key::Char('j')));
+            let _element = editor.view();
+        }
+        let down = t.elapsed();
+
+        // Navigate back UP through the table.
+        let t = Instant::now();
+        for _ in 0..steps {
+            let _ = editor.update(Message::VimKey(vim::Key::Char('k')));
+            let _element = editor.view();
+        }
+        let up = t.elapsed();
+
+        println!("[table: 22 rows]");
+        println!("  j (down):  {down:?} total, {:?}/step", down / steps);
+        println!("  k (up):    {up:?} total, {:?}/step", up / steps);
     }
 
     /// The original `HashMap`-keyed rebuild, kept here only to benchmark the new

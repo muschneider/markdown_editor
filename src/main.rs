@@ -2,6 +2,8 @@
 //! showing raw source only on the line being edited.
 
 mod app;
+mod color_picker;
+mod config;
 mod file_ops;
 mod icons;
 mod markdown_view;

@@ -59,6 +59,25 @@ cargo build --release
 cargo run
 ```
 
+## macOS Release (Apple Silicon)
+
+Tagged releases (`v*`) are built on a GitHub-hosted Apple Silicon runner and
+publish a `.dmg` containing `md_editor.app` for the `aarch64-apple-darwin`
+target (M1–M4). To build manually on an M-series Mac:
+
+```bash
+cargo install cargo-bundle
+cargo bundle --release --target aarch64-apple-darwin
+```
+
+> **Gatekeeper note:** the app is **not** codesigned or notarized, so macOS will
+> block it on first launch. Either right-click the app and choose **Open**, or
+> clear the quarantine flag:
+>
+> ```bash
+> xattr -dr com.apple.quarantine md_editor.app
+> ```
+
 ## Development
 
 ### Code Style

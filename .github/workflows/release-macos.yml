@@ -1,0 +1,61 @@
+name: Release macOS (Apple Silicon)
+
+# Builds an aarch64-apple-darwin .app bundle and packages it as a .dmg.
+# Runs natively on a GitHub-hosted Apple Silicon runner (no cross-compilation),
+# so this is plain `cargo` plus `cargo-bundle` + `hdiutil`.
+#
+# Note: all Apple Silicon (M1-M4) shares the aarch64-apple-darwin target, so a
+# binary built here on an M-series runner runs natively on an M3 Mac.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # required to attach artifacts to a GitHub Release
+
+jobs:
+  build-macos-arm64:
+    runs-on: macos-14 # Apple Silicon (M-series) -> native aarch64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-bundle
+        run: cargo install cargo-bundle
+
+      - name: Build .app bundle
+        run: cargo bundle --release --target aarch64-apple-darwin
+
+      - name: Package .dmg
+        run: |
+          set -euo pipefail
+          APP="target/aarch64-apple-darwin/release/bundle/osx/md_editor.app"
+          mkdir -p dist staging
+          cp -R "$APP" staging/
+          ln -s /Applications staging/Applications
+          hdiutil create \
+            -volname md_editor \
+            -srcfolder staging \
+            -ov -format UDZO \
+            dist/md_editor-aarch64-apple-darwin.dmg
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: md_editor-macos-arm64
+          path: dist/*.dmg
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.dmg

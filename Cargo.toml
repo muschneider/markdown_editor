@@ -6,6 +6,13 @@ description = "A simple Markdown editor with inline rendering, built with Iced"
 license = "MIT"
 rust-version = "1.88"
 
+[package.metadata.bundle]
+name = "md_editor"
+identifier = "org.localdomain.md_editor"
+category = "public.app-category.developer-tools"
+short_description = "A simple Markdown editor with inline rendering, built with Iced"
+# icon = ["assets/icon.icns"]  # optional; add an .icns for a Dock/Finder icon
+
 [dependencies]
 iced = { version = "0.14", features = ["highlighter", "markdown", "svg", "tokio"] }
 rfd = { version = "0.17", default-features = false, features = ["gtk3"] }
