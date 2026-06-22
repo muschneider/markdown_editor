@@ -44,6 +44,25 @@ pub fn active_line(theme: &Theme) -> container::Style {
     }
 }
 
+/// Style for the cursor marker drawn in the left margin of the current line in
+/// view mode (Normal).
+///
+/// A thin accent-colored vertical bar that marks the current line without
+/// changing anything about the row's own display. It is overlaid in the row's
+/// left padding, so it never shifts the rendered text.
+pub fn cursor_marker(theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(
+            theme.extended_palette().primary.base.color,
+        )),
+        border: Border {
+            radius: 1.0.into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
 /// Style for the top toolbar and bottom status bar container.
 pub fn toolbar_container(theme: &Theme) -> container::Style {
     let palette = theme.extended_palette();

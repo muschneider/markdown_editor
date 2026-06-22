@@ -275,13 +275,14 @@ impl MarkdownEditor {
         self.vim.mode == Mode::Insert
     }
 
-    /// Whether the active line is shown as raw source in a focused `text_editor`.
+    /// Whether an **edit mode** — Insert or Visual — is active.
     ///
-    /// This is true while **editing** (Insert) or **selecting** (Visual, which
-    /// needs the editor to render its selection). In Normal mode the cursor line
-    /// is rendered as Markdown like the rest of the document, and keys arrive via
-    /// a global subscription instead of the editor widget.
-    pub(super) fn vim_shows_editor(&self) -> bool {
+    /// The cursor line is always shown as a focused raw `text_editor`; this marks
+    /// the modes that decorate it with the highlighted box and that fully own
+    /// keyboard input (so the global Normal-mode key subscription is disabled).
+    /// Insert keeps the document-aware text-editing bindings; Visual routes keys
+    /// to the Vim engine for its selection.
+    pub(super) fn vim_is_edit_mode(&self) -> bool {
         matches!(self.vim.mode, Mode::Insert | Mode::Visual)
     }
 
@@ -322,7 +323,7 @@ impl MarkdownEditor {
         // A new key press clears any previous transient message.
         self.vim.status = None;
 
-        let showed_editor = self.vim_shows_editor();
+        let was_edit_mode = self.vim_is_edit_mode();
 
         let task = if self.vim.command.is_some() {
             self.command_key(key)
@@ -339,9 +340,10 @@ impl MarkdownEditor {
             }
         };
 
-        // Entering Insert/Visual mode renders the (previously absent) editor;
-        // focus it so it receives subsequent key presses.
-        if self.vim_shows_editor() && !showed_editor {
+        // Entering an edit mode (Insert/Visual) disables the global key
+        // subscription, so make sure the editor is focused to receive keys —
+        // in case input had just arrived via that subscription (focus lost).
+        if self.vim_is_edit_mode() && !was_edit_mode {
             Task::batch([task, self.focus_active()])
         } else {
             task

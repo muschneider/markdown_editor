@@ -26,7 +26,7 @@ use std::sync::Arc;
 use iced::keyboard;
 use iced::widget::{
     Column, button, column, container, markdown, mouse_area, pick_list, row, scrollable, space,
-    text, text_editor,
+    stack, text, text_editor,
 };
 use iced::{Element, Fill, Font, Subscription, Task, Theme, window};
 
@@ -89,6 +89,11 @@ const ACTIVE_LINE_ID: &str = "md-active-line";
 /// Padding applied to both the active editor and the rendered blocks so they
 /// stay horizontally aligned.
 const LINE_PADDING: u16 = 4;
+
+/// Width (px) of the cursor marker drawn in the left margin of the current line
+/// in view mode. Kept within [`LINE_PADDING`] so it sits in the row's left
+/// padding without overlapping the rendered text.
+const CURSOR_MARKER_WIDTH: f32 = 3.0;
 
 /// Number of lines moved by `PgUp`/`PgDown` (a "page").
 const PAGE_LINES: usize = 15;
@@ -166,14 +171,6 @@ pub struct MarkdownEditor {
     /// Memoized syntax-highlighted code blocks for the current theme. Cleared
     /// when the theme changes or a new document is loaded.
     code_cache: RefCell<markdown_view::CodeCache>,
-    /// In Normal mode the cursor line is rendered as Markdown rather than shown
-    /// as raw source; this holds its parsed content. `None` while editing
-    /// (Insert) or selecting (Visual), where the raw `text_editor` is shown.
-    active_render: Option<markdown::Content>,
-    /// The source text `active_render` was last parsed from, so navigation
-    /// within an unchanged region (e.g. `j`/`k` inside a table) can skip the
-    /// re-parse.
-    active_render_source: Option<String>,
     /// Vim modal-editing state (current mode, pending command, registers, …).
     vim: vim::VimState,
     /// Document snapshots for `u` (undo).
@@ -308,8 +305,6 @@ impl MarkdownEditor {
             colors: config::load(),
             show_color_panel: false,
             code_cache: RefCell::new(HashMap::new()),
-            active_render: None,
-            active_render_source: None,
             vim: vim::VimState::new(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -762,11 +757,13 @@ impl MarkdownEditor {
             at_doc_last: self.active_end >= self.lines.len(),
         };
 
-        // Whether the cursor line is shown as a raw `text_editor` (while editing
-        // in Insert mode or selecting in Visual mode) or rendered as Markdown
-        // (Normal mode). In Insert mode the original text-editing bindings apply;
-        // in Visual mode each key is routed to the Vim engine.
-        let editor_shows_raw = self.vim_shows_editor();
+        // How the cursor line is shown depends on the mode:
+        //   * Edit mode (Insert/Visual) shows it as a focused raw `text_editor`
+        //     inside the highlighted box, with a real text caret.
+        //   * View mode (Normal) renders it as Markdown exactly like every other
+        //     row — no box, no background change — and marks it only with a thin
+        //     cursor bar in the left margin, so the row's display never changes.
+        let edit_mode = self.vim_is_edit_mode();
         let vim_insert = self.vim_is_insert();
 
         // Split the rendered segments around the active editor. The editor is
@@ -792,7 +789,14 @@ impl MarkdownEditor {
         let mut after: Vec<Element<'_, Message>> = Vec::new();
         let mut editor_element: Option<Element<'_, Message>> = None;
 
-        for segment in segments(&self.lines, self.active_start, self.active_end) {
+        // In view mode the document is segmented without splitting out the cursor
+        // line (see `render_split`), so the cursor's line stays inside its block
+        // and the layout never changes as the cursor moves; the cursor's segment
+        // is found by `active_start` and marked with the left-margin bar. In edit
+        // mode the cursor line is the `Active` segment (the raw editor).
+        let (split_start, split_end) = self.render_split();
+
+        for segment in segments(&self.lines, split_start, split_end) {
             // `is_none_or` short-circuits without running the closure when there
             // is no viewport, so the per-segment line-range match costs nothing
             // on the full-render path (small documents, first frame, tests).
@@ -806,61 +810,40 @@ impl MarkdownEditor {
             });
 
             match segment {
+                // Only emitted in edit mode (Insert/Visual): the cursor line (or
+                // table) shown as a focused raw `text_editor` inside the box. It
+                // always renders for real (never windowed): it holds the focused
+                // editor and its highlighter cache, and is where the cursor is.
                 Segment::Active => {
-                    // The active region always renders for real: it holds the
-                    // focused editor (and its highlighter cache) and is, by
-                    // definition, where the cursor — hence the viewport — is.
-                    let active: Element<'_, Message> = if editor_shows_raw {
-                        // Insert/Visual: show the raw Markdown source in the editor.
-                        let editor = text_editor(&self.active_content)
-                            .id(ACTIVE_LINE_ID)
-                            .placeholder("Type Markdown…")
-                            .on_action(Message::EditorAction)
-                            .padding(LINE_PADDING)
-                            .font(Font::MONOSPACE)
-                            // Equivalent to the convenience `.highlight("md", …)`,
-                            // spelled out so it works without iced's `highlighter`
-                            // feature (which we drop to stop the Markdown parser
-                            // from eagerly highlighting every code block).
-                            .highlight_with::<iced_highlighter::Highlighter>(
-                                iced_highlighter::Settings {
-                                    theme: highlight_theme,
-                                    token: "md".to_owned(),
-                                },
-                                |highlight, _theme| highlight.to_format(),
-                            )
-                            .key_binding(move |key_press| {
-                                if vim_insert {
-                                    insert_line_binding(key_press, ctx)
-                                } else {
-                                    // Visual mode: hand every key to the Vim engine.
-                                    vim::to_vim_key(&key_press)
-                                        .map(|k| text_editor::Binding::Custom(Message::VimKey(k)))
-                                }
-                            });
-                        editor.into()
-                    } else {
-                        // Normal mode: render the cursor line as Markdown, clickable
-                        // (a click keeps the cursor here), still highlighted so it is
-                        // clear which line the cursor is on.
-                        let body: Element<'_, Message> = match &self.active_render {
-                            Some(content) => {
-                                if let Some(source) = &self.active_render_source {
-                                    viewer.set_block_source(source.clone());
-                                }
-                                markdown::view_with(content.items(), settings, &viewer)
-                                    .map(Message::LinkClicked)
+                    let editor = text_editor(&self.active_content)
+                        .id(ACTIVE_LINE_ID)
+                        .placeholder("Type Markdown…")
+                        .on_action(Message::EditorAction)
+                        .padding(LINE_PADDING)
+                        .font(Font::MONOSPACE)
+                        // Equivalent to the convenience `.highlight("md", …)`,
+                        // spelled out so it works without iced's `highlighter`
+                        // feature (which we drop to stop the Markdown parser
+                        // from eagerly highlighting every code block).
+                        .highlight_with::<iced_highlighter::Highlighter>(
+                            iced_highlighter::Settings {
+                                theme: highlight_theme,
+                                token: "md".to_owned(),
+                            },
+                            |highlight, _theme| highlight.to_format(),
+                        )
+                        .key_binding(move |key_press| {
+                            if vim_insert {
+                                insert_line_binding(key_press, ctx)
+                            } else {
+                                // Visual mode: hand every key to the Vim engine.
+                                vim::to_vim_key(&key_press)
+                                    .map(|k| text_editor::Binding::Custom(Message::VimKey(k)))
                             }
-                            None => text(self.lines[self.active_start..self.active_end].join("\n"))
-                                .into(),
-                        };
-                        mouse_area(container(body).width(Fill).padding(LINE_PADDING))
-                            .on_press(Message::Activate(self.active_start))
-                            .into()
-                    };
+                        });
 
                     editor_element = Some(
-                        container(active)
+                        container(editor)
                             .width(Fill)
                             .style(app_theme::active_line)
                             .into(),
@@ -870,13 +853,19 @@ impl MarkdownEditor {
                     let element: Element<'_, Message> = if in_window {
                         // A space keeps the empty line clickable and gives the
                         // document natural paragraph spacing.
-                        mouse_area(
+                        let blank = mouse_area(
                             container(text(" ").font(Font::MONOSPACE))
                                 .width(Fill)
                                 .padding(LINE_PADDING),
                         )
-                        .on_press(Message::Activate(index))
-                        .into()
+                        .on_press(Message::Activate(index));
+
+                        // View mode: mark the cursor's (blank) line.
+                        if !edit_mode && index == self.active_start {
+                            mark_cursor_line(blank.into())
+                        } else {
+                            blank.into()
+                        }
                     } else {
                         // Off-screen: a height-only placeholder keeps the
                         // scrollable's content height stable.
@@ -905,9 +894,18 @@ impl MarkdownEditor {
                             // segment walk, so this should not happen.
                             None => text(self.lines[start..end].join("\n")).into(),
                         };
-                        mouse_area(container(body).width(Fill).padding(LINE_PADDING))
-                            .on_press(Message::Activate(start))
-                            .into()
+                        let block = mouse_area(container(body).width(Fill).padding(LINE_PADDING))
+                            .on_press(Message::Activate(start));
+
+                        // View mode: the cursor line is rendered inside its block
+                        // (never split out), so mark the block that contains it.
+                        // The block is rendered identically whether or not the
+                        // cursor is in it, so the layout never changes.
+                        if !edit_mode && (start..end).contains(&self.active_start) {
+                            mark_cursor_line(block.into())
+                        } else {
+                            block.into()
+                        }
                     } else {
                         // Off-screen: a height-only placeholder keeps the
                         // scrollable's content height stable so the viewport
@@ -927,9 +925,9 @@ impl MarkdownEditor {
             }
         }
 
-        // `segments` always yields exactly one active region (the invariant
-        // `active_start < lines.len()` guarantees it), but fall back gracefully
-        // rather than ever panicking inside `view`.
+        // In edit mode `segments` yields exactly one `Active` segment (the raw
+        // editor); in view mode there is none (the cursor line is rendered inside
+        // its block), so the middle slot collapses to nothing.
         let editor_element = editor_element.unwrap_or_else(|| space::vertical().height(0).into());
 
         let document = container(
@@ -1028,15 +1026,15 @@ impl MarkdownEditor {
         self.theme.clone()
     }
 
-    /// Keyboard handling for modes where no `text_editor` is focused.
+    /// Keyboard handling for view (Normal) mode.
     ///
-    /// In Normal mode the document — including the cursor line — is rendered as
-    /// Markdown, so there is no focused editor to receive keys. A global key
+    /// In view mode the cursor line is rendered as Markdown like the rest of the
+    /// document, so there is no focused editor to receive keys: a global key
     /// listener feeds them to the Vim engine instead. While editing (Insert) or
-    /// selecting (Visual) the focused editor handles keys, so the subscription is
-    /// disabled to avoid double handling.
+    /// selecting (Visual) the focused `text_editor` handles keys, so the
+    /// subscription is disabled to avoid double handling.
     pub fn subscription(&self) -> Subscription<Message> {
-        if self.vim_shows_editor() {
+        if self.vim_is_edit_mode() {
             Subscription::none()
         } else {
             iced::event::listen_with(on_key_event)
@@ -1057,13 +1055,32 @@ impl MarkdownEditor {
         // once and stalled the open. The scrollable overwrites this with its
         // real bounds on the next layout.
         self.viewport = Some((0.0, INITIAL_VIEWPORT_HEIGHT));
-        // The old active-region parse is stale.
-        self.active_render_source = None;
     }
 
     /// Reconstruct the full document text from its lines.
     fn document_text(&self) -> String {
         self.lines.join("\n")
+    }
+
+    /// The line range split out as the editable [`Segment::Active`] when the
+    /// document is segmented for rendering.
+    ///
+    /// In **edit mode** (Insert/Visual) the cursor line (or table) is split out
+    /// of its block and shown as a raw `text_editor`, so the range is the real
+    /// `active_start..active_end`.
+    ///
+    /// In **view mode** (Normal) nothing is split out: the cursor line is
+    /// rendered as Markdown *inside* its block, exactly like every other line, so
+    /// the document layout never changes as the cursor moves between lines (a
+    /// soft-wrapped paragraph is not broken apart when the cursor enters it). A
+    /// range at the end of the document makes [`segments`] emit no `Active`
+    /// segment, leaving every block whole.
+    fn render_split(&self) -> (usize, usize) {
+        if self.vim_is_edit_mode() {
+            (self.active_start, self.active_end)
+        } else {
+            (self.lines.len(), self.lines.len())
+        }
     }
 
     /// Rebuild the rendered blocks from the current lines and active range,
@@ -1075,8 +1092,11 @@ impl MarkdownEditor {
     /// Parsed blocks are cached by their source text and moved into the new
     /// layout when unchanged; only genuinely new text is parsed.
     fn rebuild_blocks(&mut self) {
-        // The new blocks, as line ranges, in document order.
-        let ranges: Vec<(usize, usize)> = segments(&self.lines, self.active_start, self.active_end)
+        // The new blocks, as line ranges, in document order. The split range
+        // depends on the mode: view mode keeps every block whole (no Active
+        // segment), so the cursor moving never changes the set of blocks.
+        let (split_start, split_end) = self.render_split();
+        let ranges: Vec<(usize, usize)> = segments(&self.lines, split_start, split_end)
             .into_iter()
             .filter_map(|segment| match segment {
                 Segment::Block { start, end } => Some((start, end)),
@@ -1151,29 +1171,6 @@ impl MarkdownEditor {
 
         self.block_sources = sources;
         self.blocks = blocks;
-
-        // In Normal mode the cursor line is rendered as Markdown, so parse the
-        // active region too. It is at most a few lines (a single line, or a whole
-        // table), so a direct parse is cheap — but re-parsing on every `j`/`k`
-        // step within a table is wasteful, so the result is cached by source
-        // text and reused when the active region hasn't changed. While
-        // editing/selecting the raw editor is shown instead, so skip entirely.
-        if self.vim_shows_editor() {
-            self.active_render = None;
-            self.active_render_source = None;
-        } else {
-            let source = self.lines[self.active_start..self.active_end].join("\n");
-            let needs_parse = match &self.active_render_source {
-                Some(prev) => prev != &source,
-                None => true,
-            };
-            if needs_parse {
-                self.active_render_source = Some(source);
-                self.active_render = Some(markdown::Content::parse(
-                    self.active_render_source.as_ref().unwrap(),
-                ));
-            }
-        }
     }
 
     /// Make `line` part of the active (raw) region and place the cursor on it.
@@ -1260,10 +1257,8 @@ fn message_affects_blocks(message: &Message) -> bool {
         // A raw-editor action never changes the *rendered* blocks, so it never
         // needs a rebuild — not even when it is an edit.
         //
-        // The editor is only shown for the active region (Insert/Visual mode),
-        // and that region is painted straight from `active_content`, never from
-        // `blocks` or `active_render`. An edit only ever rewrites lines *inside*
-        // that region, so:
+        // The active region is painted straight from `active_content`, never from
+        // `blocks`. An edit only ever rewrites lines *inside* that region, so:
         //   * every non-active block keeps its exact source text, and
         //   * the number and order of `Segment::Block`s is unchanged (adding or
         //     removing lines inside the active region only shifts the indices of
@@ -1293,6 +1288,25 @@ fn message_affects_blocks(message: &Message) -> bool {
         // Everything else may change the document or the active region.
         _ => true,
     }
+}
+
+/// Overlay the left-margin cursor marker on a view-mode row.
+///
+/// The marker is a thin vertical bar drawn *on top* of the row (via a `stack`),
+/// so it does not take part in the row's layout: the rendered text is not
+/// shifted and stays aligned with every other row. It sits in the row's left
+/// padding, just left of the text, and spans the row's height.
+///
+/// The stack must be told to fill the width — it defaults to `Shrink`, which
+/// would re-lay-out the row in a narrower box and make it wrap differently from
+/// the other rows. With `Fill` the row is laid out exactly as it would be
+/// without the marker.
+fn mark_cursor_line(row: Element<'_, Message>) -> Element<'_, Message> {
+    let marker = container(space::vertical())
+        .width(CURSOR_MARKER_WIDTH)
+        .height(Fill)
+        .style(app_theme::cursor_marker);
+    stack![row, marker].width(Fill).into()
 }
 
 /// Walk the document, grouping it into renderable [`Segment`]s.
@@ -1669,8 +1683,10 @@ mod tests {
         editor.load_document("# Title\n\n| A | B |\n|---|---|\n| 1 | 2 |");
         editor.rebuild_blocks();
 
-        // Active line 0 -> two blocks: the intro paragraph and the table.
-        let block_count = segments(&editor.lines, editor.active_start, editor.active_end)
+        // `rebuild_blocks` uses the mode-dependent split range, so the test must
+        // segment the same way to count the expected blocks.
+        let (start, end) = editor.render_split();
+        let block_count = segments(&editor.lines, start, end)
             .iter()
             .filter(|s| matches!(s, Segment::Block { .. }))
             .count();
@@ -2055,71 +2071,92 @@ mod tests {
     }
 
     // -- Mode-dependent rendering of the cursor line ---------------------
+    //
+    // In view mode (Normal) the cursor line is rendered as Markdown *inside its
+    // block*, exactly like every other line: the block is never split at the
+    // cursor, so moving the cursor through a (soft-wrapped) paragraph never
+    // reflows it. The cursor is shown only by the left-margin marker. In edit
+    // mode (Insert/Visual) the cursor line is split out into the `Active`
+    // segment (the raw editor), so it leaves its block.
 
     fn send_vim(editor: &mut MarkdownEditor, key: vim::Key) {
         let _ = editor.update(Message::VimKey(key));
     }
 
     #[test]
-    fn normal_mode_renders_cursor_line_as_markdown() {
+    fn view_mode_does_not_split_the_cursor_block() {
         let (mut editor, _t) = MarkdownEditor::new_with_file(None);
-        editor.load_document("# Title");
+        // A soft-wrapped paragraph: two contiguous source lines forming one
+        // block that renders (joined) as a single paragraph.
+        editor.load_document("alpha line\nbeta line");
         editor.rebuild_blocks();
-
-        // Default mode is Normal: the cursor line is parsed for rendering, and
-        // the editor widget is not shown.
         assert_eq!(editor.vim_mode_label(), "NORMAL");
-        assert!(editor.active_render.is_some());
-        assert!(!editor.vim_shows_editor());
 
-        // `view()` must succeed in Normal mode (it renders Markdown there).
+        // The whole paragraph is one block regardless of which line the cursor is
+        // on — so the cursor moving never reflows it.
+        let whole = vec!["alpha line\nbeta line".to_owned()];
+        assert_eq!(editor.block_sources, whole);
+
+        // Move the cursor down onto the second source line: still one block, the
+        // exact same rendering.
+        send_vim(&mut editor, vim::Key::Char('j'));
+        assert_eq!(editor.active_start, 1);
+        assert_eq!(editor.block_sources, whole);
         let _ = editor.view();
     }
 
     #[test]
-    fn entering_insert_shows_raw_editor_instead_of_render() {
+    fn entering_insert_splits_the_cursor_line_out() {
         let (mut editor, _t) = MarkdownEditor::new_with_file(None);
-        editor.load_document("# Title");
+        editor.load_document("alpha line\nbeta line");
         editor.rebuild_blocks();
-        assert!(editor.active_render.is_some());
+        assert_eq!(
+            editor.block_sources,
+            vec!["alpha line\nbeta line".to_owned()]
+        );
 
-        // `i` drops into Insert mode via the Vim engine.
+        // `i` enters Insert on line 0: it is split out as the raw editor, leaving
+        // the remaining line as its own block.
         send_vim(&mut editor, vim::Key::Char('i'));
         assert_eq!(editor.vim_mode_label(), "INSERT");
-        assert!(editor.vim_shows_editor());
-
-        // While editing, the cursor line is no longer rendered as Markdown.
+        assert!(editor.vim_is_edit_mode());
         editor.rebuild_blocks();
-        assert!(editor.active_render.is_none());
+        assert_eq!(editor.block_sources, vec!["beta line".to_owned()]);
+        let _ = editor.view();
     }
 
     #[test]
-    fn leaving_insert_reverts_to_markdown_rendering() {
+    fn leaving_insert_rejoins_the_block() {
         let (mut editor, _t) = MarkdownEditor::new_with_file(None);
-        editor.load_document("# Title");
-        editor.rebuild_blocks();
+        editor.load_document("alpha line\nbeta line");
         send_vim(&mut editor, vim::Key::Char('i'));
         editor.rebuild_blocks();
-        assert!(editor.active_render.is_none());
+        assert_eq!(editor.block_sources, vec!["beta line".to_owned()]);
 
-        // Esc leaves Insert; the cursor line is rendered again.
+        // Esc leaves Insert; the cursor line rejoins its block (view mode).
         send_vim(&mut editor, vim::Key::Esc);
         assert_eq!(editor.vim_mode_label(), "NORMAL");
+        assert!(!editor.vim_is_edit_mode());
         editor.rebuild_blocks();
-        assert!(editor.active_render.is_some());
+        assert_eq!(
+            editor.block_sources,
+            vec!["alpha line\nbeta line".to_owned()]
+        );
+        let _ = editor.view();
     }
 
     #[test]
-    fn visual_mode_shows_the_raw_editor_for_selection() {
+    fn visual_mode_splits_the_cursor_line_out() {
         let (mut editor, _t) = MarkdownEditor::new_with_file(None);
-        editor.load_document("hello world");
+        editor.load_document("alpha line\nbeta line");
         editor.rebuild_blocks();
 
         send_vim(&mut editor, vim::Key::Char('v'));
         assert_eq!(editor.vim_mode_label(), "VISUAL");
-        assert!(editor.vim_shows_editor());
+        assert!(editor.vim_is_edit_mode());
         editor.rebuild_blocks();
-        assert!(editor.active_render.is_none());
+        assert_eq!(editor.block_sources, vec!["beta line".to_owned()]);
+        let _ = editor.view();
     }
 
     // -- Per-tag color customization -----------------------------------
@@ -2282,8 +2319,10 @@ mod tests {
 
     /// The block sources a *full* rebuild would produce, used as the ground
     /// truth the incremental [`MarkdownEditor::rebuild_blocks`] must match.
+    /// Uses the same mode-dependent split range as `rebuild_blocks`.
     fn expected_block_sources(editor: &MarkdownEditor) -> Vec<String> {
-        segments(&editor.lines, editor.active_start, editor.active_end)
+        let (start, end) = editor.render_split();
+        segments(&editor.lines, start, end)
             .into_iter()
             .filter_map(|segment| match segment {
                 Segment::Block { start, end } => Some(editor.lines[start..end].join("\n")),
@@ -2299,10 +2338,10 @@ mod tests {
         editor.rebuild_blocks();
         assert_eq!(editor.block_sources, expected_block_sources(&editor));
 
-        // Walk the active line all the way down (crossing the table, which makes
-        // the raw region span several lines) and back up. Every step rebuilds via
-        // the prefix/suffix reuse path, so this proves the reuse never desyncs the
-        // cached parses from the real document.
+        // Walk the active line all the way down (crossing the table) and back up.
+        // In view mode the blocks stay whole regardless of the cursor, and every
+        // step rebuilds via the prefix/suffix reuse path, so this proves the reuse
+        // never desyncs the cached parses from the real document.
         for _ in 0..15 {
             let _ = editor.update(Message::MoveDown);
             assert_eq!(editor.block_sources, expected_block_sources(&editor));
@@ -2339,11 +2378,17 @@ mod tests {
         editor.load_document("# Title\n\nbody\n\nmore");
         editor.activate_line(2, 0); // "body"
         editor.rebuild_blocks();
-        let before = editor.block_sources.clone();
 
-        // Enter Insert mode, then type. Edits must NOT trigger a block rebuild…
+        // Enter Insert mode: the cursor line ("body") is split out as the raw
+        // editor, so the surrounding blocks no longer include it.
         send_vim(&mut editor, vim::Key::Char('i'));
         let blocks_at_insert = editor.block_sources.clone();
+        assert_eq!(
+            blocks_at_insert,
+            vec!["# Title".to_owned(), "more".to_owned()]
+        );
+
+        // Typing must NOT trigger a block rebuild…
         for ch in "XYZ".chars() {
             let _ = editor.update(Message::EditorAction(text_editor::Action::Edit(
                 text_editor::Edit::Insert(ch),
@@ -2354,7 +2399,6 @@ mod tests {
         // rewrites the active region (rendered straight from the raw editor),
         // never the surrounding blocks.
         assert_eq!(editor.block_sources, blocks_at_insert);
-        assert_eq!(editor.block_sources, before);
         assert_eq!(editor.block_sources, expected_block_sources(&editor));
         assert_eq!(editor.lines[2], "XYZbody");
         // The view still builds correctly against the un-rebuilt blocks.
@@ -2535,7 +2579,7 @@ mod tests {
 
         // A document with a 20-row table — exercises the worst case for
         // navigation: the active region spans the whole table, so every j/k
-        // recreates the editor content and re-parses the table as Markdown.
+        // recreates the editor content and rebuilds the surrounding blocks.
         let mut doc = String::from("intro line\n\n");
         doc.push_str("| Col A | Col B | Col C |\n");
         doc.push_str("|-------|-------|-------|\n");
@@ -2548,8 +2592,8 @@ mod tests {
         editor.load_document(&doc);
         editor.rebuild_blocks();
 
-        // Navigate DOWN into and through the table (Normal mode, so each step
-        // also re-parses active_render).
+        // Navigate DOWN into and through the table (Normal mode), rebuilding the
+        // blocks and the view at each step.
         let steps = 30;
         let t = Instant::now();
         for _ in 0..steps {
