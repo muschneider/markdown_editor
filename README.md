@@ -8,11 +8,30 @@ This project was implemented using **vibe coding** — an AI-assisted developmen
 
 ## Features
 
-- **Live Preview**: Side-by-side editing with real-time Markdown rendering
+- **Inline rendering**: the document is shown rendered; only the line under the
+  cursor falls back to raw Markdown source, so there is no separate preview pane
+- **Whole-table editing**: entering a table makes the entire table editable at
+  once, so rows never fall apart mid-edit
+- **Windowed rendering**: only the segments near the viewport are built into the
+  widget tree, so large documents stay responsive
 - **File Operations**: Open and save Markdown files via native file dialogs
 - **Formatting Toolbar**: Quick access to common Markdown formatting options
-- **Dark Theme**: Easy on the eyes for long writing sessions
-- **Keyboard Shortcuts**: Efficient editing with custom key bindings
+- **Themes**: every built-in Iced theme, plus per-tag Markdown color overrides
+  persisted to `$XDG_CONFIG_HOME/md_editor/config.yaml`
+
+## Keyboard Shortcuts
+
+| Keys                      | Action                     |
+| ------------------------- | -------------------------- |
+| `Ctrl+N` / `Ctrl+O` / `Ctrl+S` | New / open / save     |
+| `Ctrl+Z` / `Ctrl+Y`       | Undo / redo                |
+| `Ctrl+B` / `Ctrl+I`       | Bold / italic              |
+| `Ctrl+←` / `Ctrl+→`       | Move by word               |
+| `Home` / `End`            | Start / end of line        |
+| `PgUp` / `PgDn`           | Move a page                |
+| `Ctrl+Home` / `Ctrl+End`  | Start / end of document    |
+
+Clicking a rendered block moves the cursor into it.
 
 ## Screenshots
 
@@ -107,11 +126,16 @@ cargo test -- --nocapture
 
 ```
 src/
-  main.rs       # Application entry point
-  app.rs        # Core state and UI logic
-  file_ops.rs   # Async file I/O operations
-  theme.rs      # Dark theme styles
-  toolbar.rs    # Formatting toolbar
+  main.rs          # Application entry point
+  app.rs           # Core state, messages, update/view logic
+  color_picker.rs  # Per-tag color customization widget
+  config.rs        # Persist color config to $XDG_CONFIG_HOME
+  file_ops.rs      # Async file I/O operations
+  history.rs       # Undo/redo, recorded as line-range replacements
+  icons.rs         # SVG icons for the toolbar
+  markdown_view.rs # Theme-aware Markdown rendering + code highlighting
+  theme.rs         # Theme styles and per-tag Markdown colors
+  toolbar.rs       # Formatting toolbar
 ```
 
 ## Technologies

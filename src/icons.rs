@@ -54,6 +54,18 @@ icon!(
 );
 
 icon!(
+    /// Undo the last edit.
+    undo = "<path d=\"M3 7v6h6\"/>\
+            <path d=\"M3 13a9 9 0 1 0 3-7.7L3 8\"/>"
+);
+
+icon!(
+    /// Redo the last undone edit.
+    redo = "<path d=\"M21 7v6h-6\"/>\
+            <path d=\"M21 13a9 9 0 1 1-3-7.7L21 8\"/>"
+);
+
+icon!(
     /// Bold (`**text**`).
     bold = "<path d=\"M6 4h8a4 4 0 0 1 0 8H6z\"/><path d=\"M6 12h9a4 4 0 0 1 0 8H6z\"/>"
 );

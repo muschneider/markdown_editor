@@ -10,7 +10,7 @@
 //! switching themes. An empty value means "follow the theme", so overrides
 //! compose cleanly on top of whichever [`Theme`] is selected.
 
-use iced::widget::{button, container, svg, text};
+use iced::widget::{button, container, svg, text, text_editor};
 use iced::{Background, Border, Color, Theme};
 use iced_highlighter as highlighter;
 
@@ -29,37 +29,22 @@ pub fn editor_pane(theme: &Theme) -> container::Style {
     }
 }
 
-/// Highlight style for the line currently being edited (raw source).
-pub fn active_line(theme: &Theme) -> container::Style {
-    let palette = theme.extended_palette();
-    container::Style {
-        background: Some(Background::Color(palette.background.weak.color)),
-        border: Border {
-            // An accent-colored frame marks the active line per theme.
-            color: palette.primary.base.color,
-            width: 1.0,
-            radius: 4.0.into(),
-        },
-        ..Default::default()
-    }
-}
-
-/// Style for the cursor marker drawn in the left margin of the current line in
-/// view mode (Normal).
+/// Style for the raw editor shown on the cursor's line.
 ///
-/// A thin accent-colored vertical bar that marks the current line without
-/// changing anything about the row's own display. It is overlaid in the row's
-/// left padding, so it never shifts the rendered text.
-pub fn cursor_marker(theme: &Theme) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(
-            theme.extended_palette().primary.base.color,
-        )),
-        border: Border {
-            radius: 1.0.into(),
-            ..Default::default()
-        },
-        ..Default::default()
+/// Deliberately chrome-less: no fill and no frame, so the line being edited
+/// sits in the page exactly like the rendered lines around it and the **caret
+/// alone** shows where the cursor is. The `text_editor` default paints a
+/// filled, bordered box, which made the current row read as a form field
+/// dropped into the document and flickered a box from row to row while moving
+/// the cursor.
+///
+/// Only the chrome is dropped — the text, selection and placeholder colors
+/// still come from the theme's default.
+pub fn active_line(theme: &Theme, status: text_editor::Status) -> text_editor::Style {
+    text_editor::Style {
+        background: Background::Color(Color::TRANSPARENT),
+        border: Border::default(),
+        ..text_editor::default(theme, status)
     }
 }
 

@@ -38,11 +38,123 @@ type Line = Arc<[Span<'static, Uri>]>;
 /// The highlighted lines of a whole code block, cheap to clone (`Arc`).
 type Lines = Arc<[Line]>;
 
-/// Memoized syntax-highlighted code blocks, keyed by `language\0code`.
+/// Memoized syntax highlighting.
 ///
-/// Owned by the application and cleared when the theme changes (the cached
-/// colors are theme-specific) or a new document is loaded.
-pub type CodeCache = HashMap<String, Lines>;
+/// Owned by the application and cleared when the theme changes (both the
+/// cached colors and the highlighters are theme-specific) or a new document is
+/// loaded.
+#[derive(Default)]
+pub struct CodeCache {
+    /// Already highlighted code blocks, keyed by `language\0code`.
+    blocks: HashMap<String, Lines>,
+    /// One reusable highlighter per language token.
+    ///
+    /// Building one is expensive — syntect compiles the theme's scope
+    /// selectors and linearly scans a syntax set with hundreds of entries —
+    /// and it dominated the cost of highlighting: a fresh highlighter per code
+    /// block made opening or scrolling into code-heavy documents stall for
+    /// milliseconds per block. `Stream::reset` returns a used one to its
+    /// initial state, so one per language is enough.
+    streams: HashMap<String, highlighter::Stream>,
+}
+
+impl CodeCache {
+    /// Drop every memoized highlight and highlighter (the theme changed, or a
+    /// new document was loaded).
+    pub fn clear(&mut self) {
+        self.blocks.clear();
+        self.streams.clear();
+    }
+
+    /// The highlighted lines of `code`, highlighting it if this is the first
+    /// time it is seen.
+    fn highlighted(
+        &mut self,
+        code: &str,
+        language: Option<&str>,
+        theme: highlighter::Theme,
+    ) -> Lines {
+        let language = language.unwrap_or("txt");
+        let key = format!("{language}\u{0}{code}");
+
+        if let Some(lines) = self.blocks.get(&key) {
+            return lines.clone();
+        }
+
+        let stream = self.streams.entry(language.to_owned()).or_insert_with(|| {
+            highlighter::Stream::new(&highlighter::Settings {
+                theme,
+                token: language.to_owned(),
+            })
+        });
+        stream.reset();
+
+        let lines = highlight(stream, code);
+        self.blocks.insert(key, lines.clone());
+        lines
+    }
+}
+
+/// Languages compiled ahead of time by [`warm_up`], most urgent first.
+///
+/// `md` comes first because the active line's editor highlights Markdown from
+/// the very first frame; the rest are the languages a Markdown document is most
+/// likely to fence.
+const WARM_UP_LANGUAGES: &[&str] = &[
+    "md",
+    "rust",
+    "python",
+    "javascript",
+    "typescript",
+    "json",
+    "bash",
+    "html",
+    "css",
+    "yaml",
+    "toml",
+    "sql",
+    "c",
+    "cpp",
+    "go",
+    "java",
+];
+
+/// Compile the syntax definitions for common languages on a background thread.
+///
+/// Two separate costs are paid lazily by the syntax highlighter, and both used
+/// to land on the UI thread at the worst possible moment:
+///
+/// * loading the process-wide syntax and theme sets (tens of milliseconds), on
+///   the very first frame — the editor line is Markdown-highlighted; and
+/// * compiling an individual language's regex contexts the first time a code
+///   block in that language is highlighted. This is by far the worse of the
+///   two: JavaScript alone takes ~50 ms and Python ~25 ms, so simply scrolling
+///   a fenced block into view froze the window for several frames.
+///
+/// Both results are cached process-wide, so doing the work up front on another
+/// thread means it is already done — and free — by the time a block needs it.
+/// Unknown language tokens fall back to plain text and cost nothing.
+///
+/// `theme` should be the one the editor starts with, so the theme-side caches
+/// are warmed too.
+pub fn warm_up(theme: highlighter::Theme) {
+    // A snippet with a keyword, an identifier, a string, a number and a
+    // comment: enough to reach the contexts a real code block will hit, so
+    // they are compiled here rather than on the UI thread later.
+    const SNIPPET: &str = "let x = \"s\"; /* 1 */";
+
+    std::thread::spawn(move || {
+        for token in WARM_UP_LANGUAGES {
+            let mut stream = highlighter::Stream::new(&highlighter::Settings {
+                theme,
+                token: (*token).to_owned(),
+            });
+            // Parsing a line is what forces the contexts to compile; creating
+            // the stream alone does not.
+            let _ = stream.highlight_line(SNIPPET).count();
+        }
+    });
+}
 
 /// Build [`markdown::Settings`] whose inline-code and link colors follow `theme`,
 /// with per-tag overrides from `colors` taking precedence.
@@ -101,7 +213,11 @@ pub struct Viewer<'a> {
     /// cell content, and it removes vertical column separators and wraps the
     /// table in a shrink-width scrollable. Parsing from the source lets us
     /// build a custom `iced::widget::table` with both separators and fill width.
-    block_source: RefCell<Option<String>>,
+    ///
+    /// Borrowed rather than owned: the source lives in the application state
+    /// for as long as the viewer does, so copying it per block per frame was
+    /// pure waste.
+    block_source: Cell<Option<&'a str>>,
 }
 
 impl<'a> Viewer<'a> {
@@ -128,7 +244,7 @@ impl<'a> Viewer<'a> {
             in_table: Cell::new(false),
             table_column_count: Cell::new(0),
             content_call_index: Cell::new(0),
-            block_source: RefCell::new(None),
+            block_source: Cell::new(None),
         }
     }
 
@@ -196,8 +312,8 @@ impl<'a> Viewer<'a> {
     /// parse table cells from the source. The library's `markdown::Row::cells`
     /// field is private, so without the source we cannot build a custom table
     /// with column separators and fill width.
-    pub fn set_block_source(&self, source: String) {
-        *self.block_source.borrow_mut() = Some(source);
+    pub fn set_block_source(&self, source: Option<&'a str>) {
+        self.block_source.set(source);
     }
 
     /// Build a custom `iced::widget::table` from the block source, with both
@@ -208,8 +324,7 @@ impl<'a> Viewer<'a> {
     /// Returns `None` when the source does not contain a parseable table, in
     /// which case the caller falls back to `markdown::table`.
     fn build_custom_table(&self, settings: markdown::Settings) -> Option<Element<'a, Uri>> {
-        let source = self.block_source.borrow();
-        let parsed = parse_table_source(source.as_deref()?)?;
+        let parsed = parse_table_source(self.block_source.get()?)?;
 
         let colors = CellColors {
             header_text: self.table_header_text,
@@ -355,7 +470,6 @@ impl<'a> markdown::Viewer<'a, Uri> for Viewer<'a> {
         code: &'a str,
         _lines: &'a [markdown::Text],
     ) -> Element<'a, Uri> {
-        let key = format!("{}\u{0}{}", language.unwrap_or(""), code);
         let background = self.code_block_background;
 
         // Reuse the cached highlight unless this exact block is new. The cache is
@@ -363,9 +477,7 @@ impl<'a> markdown::Viewer<'a, Uri> for Viewer<'a> {
         let lines = self
             .cache
             .borrow_mut()
-            .entry(key)
-            .or_insert_with(|| highlight(code, language, self.code_theme))
-            .clone();
+            .highlighted(code, language, self.code_theme);
 
         let rows = lines.iter().cloned().map(|spans| {
             rich_text(spans)
@@ -432,14 +544,9 @@ impl<'a> markdown::Viewer<'a, Uri> for Viewer<'a> {
     }
 }
 
-/// Syntax-highlight `code` line by line with the given highlighter `theme`,
+/// Syntax-highlight `code` line by line with a freshly reset `stream`,
 /// returning cheap-to-clone styled spans for each line.
-fn highlight(code: &str, language: Option<&str>, theme: highlighter::Theme) -> Lines {
-    let mut stream = highlighter::Stream::new(&highlighter::Settings {
-        theme,
-        token: language.unwrap_or("txt").to_owned(),
-    });
-
+fn highlight(stream: &mut highlighter::Stream, code: &str) -> Lines {
     let mut lines: Vec<Line> = Vec::new();
 
     for line in code.lines() {

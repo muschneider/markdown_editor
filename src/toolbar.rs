@@ -94,11 +94,22 @@ pub(crate) fn icon_button<'a>(
     tip: &'a str,
     message: Message,
 ) -> Element<'a, Message> {
+    icon_button_maybe(icon, tip, Some(message))
+}
+
+/// Like [`icon_button`], but disabled (greyed out, unclickable) when `message`
+/// is `None` — used for undo/redo, which are unavailable at the ends of the
+/// history.
+pub(crate) fn icon_button_maybe<'a>(
+    icon: Handle,
+    tip: &'a str,
+    message: Option<Message>,
+) -> Element<'a, Message> {
     tooltip(
         button(svg(icon).width(18).height(18).style(theme::toolbar_icon))
             .padding(6)
             .style(theme::toolbar_button)
-            .on_press(message),
+            .on_press_maybe(message),
         tip,
         tooltip::Position::Bottom,
     )

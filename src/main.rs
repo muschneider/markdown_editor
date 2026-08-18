@@ -5,6 +5,7 @@ mod app;
 mod color_picker;
 mod config;
 mod file_ops;
+mod history;
 mod icons;
 mod markdown_view;
 mod theme;
@@ -15,6 +16,10 @@ use std::path::PathBuf;
 use app::MarkdownEditor;
 
 fn main() -> iced::Result {
+    // Pay the syntax highlighter's one-off initialization off the UI thread,
+    // before the first frame ever asks for it.
+    markdown_view::warm_up(theme::code_highlighter(&app::DEFAULT_THEME));
+
     let initial_file = initial_file_from_args();
 
     iced::application(
@@ -22,7 +27,6 @@ fn main() -> iced::Result {
         MarkdownEditor::update,
         MarkdownEditor::view,
     )
-    .subscription(MarkdownEditor::subscription)
     .theme(MarkdownEditor::theme)
     .title(MarkdownEditor::title)
     .run()
