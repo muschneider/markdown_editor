@@ -8,27 +8,51 @@ mod file_ops;
 mod history;
 mod icons;
 mod markdown_view;
+mod search;
+mod settings;
 mod theme;
 mod toolbar;
 
 use std::path::PathBuf;
 
+use iced::window;
+
 use app::MarkdownEditor;
 
+/// Wayland `app_id` / X11 `WM_CLASS` reported for our window.
+///
+/// Must stay equal to the basename of `packaging/md_editor.desktop`: that is
+/// the only thing tying a running window back to its installed desktop entry,
+/// and therefore to its icon in docks, task switchers and panels.
+const APPLICATION_ID: &str = "md_editor";
+
 fn main() -> iced::Result {
+    // Read the configuration once, here rather than in the editor's
+    // constructor: the highlighter warm-up below needs the *persisted* theme,
+    // and warming the wrong one would compile every language's contexts twice.
+    let config = config::load();
+
     // Pay the syntax highlighter's one-off initialization off the UI thread,
     // before the first frame ever asks for it.
-    markdown_view::warm_up(theme::code_highlighter(&app::DEFAULT_THEME));
+    markdown_view::warm_up(theme::code_highlighter(&config.settings.theme));
 
     let initial_file = initial_file_from_args();
 
     iced::application(
-        move || MarkdownEditor::new_with_file(initial_file.clone()),
+        move || MarkdownEditor::new(config.clone(), initial_file.clone()),
         MarkdownEditor::update,
         MarkdownEditor::view,
     )
+    .subscription(MarkdownEditor::subscription)
     .theme(MarkdownEditor::theme)
     .title(MarkdownEditor::title)
+    .window(window::Settings {
+        platform_specific: window::settings::PlatformSpecific {
+            application_id: APPLICATION_ID.to_owned(),
+            ..Default::default()
+        },
+        ..Default::default()
+    })
     .run()
 }
 

@@ -161,13 +161,17 @@ pub fn warm_up(theme: highlighter::Theme) {
 ///
 /// Link colors are already palette-derived by [`markdown::Style::from_palette`];
 /// here we additionally theme inline code, which the default leaves hardcoded.
-pub fn settings(theme: &Theme, colors: &MarkdownColors) -> markdown::Settings {
+///
+/// `text_size` is the body text size in pixels; heading, code and spacing sizes
+/// are derived from it proportionally by [`markdown::Settings::with_text_size`],
+/// so the whole document scales from a single number.
+pub fn settings(theme: &Theme, colors: &MarkdownColors, text_size: f32) -> markdown::Settings {
     let mut style = markdown::Style::from_palette(theme.palette());
     style.inline_code_color = colors.inline_code_color(theme);
     style.inline_code_highlight.background =
         Background::Color(colors.inline_code_background(theme));
     style.link_color = colors.link_color(theme);
-    markdown::Settings::with_style(style)
+    markdown::Settings::with_text_size(text_size, style)
 }
 
 /// A [`markdown::Viewer`] that colors text and code per the selected theme and

@@ -65,7 +65,13 @@ impl Search {
         self.matches.clear();
         if !self.query.is_empty() {
             for (index, line) in lines.iter().enumerate() {
-                collect_line_matches(line, &self.query, self.case_sensitive, index, &mut self.matches);
+                collect_line_matches(
+                    line,
+                    &self.query,
+                    self.case_sensitive,
+                    index,
+                    &mut self.matches,
+                );
             }
         }
 
@@ -110,17 +116,6 @@ impl Search {
         };
 
         self.current_match()
-    }
-
-    /// Drop the highlighted match from the list without re-searching.
-    ///
-    /// Used after a single replacement: the replaced text is gone, and the
-    /// following matches on the same line have shifted, so the list is
-    /// recomputed by the caller — this only keeps the index sane in between.
-    pub fn forget_current(&mut self) {
-        if self.current < self.matches.len() {
-            self.matches.remove(self.current);
-        }
     }
 
     /// Total number of matches.
@@ -208,12 +203,12 @@ pub fn view(search: &Search) -> Element<'_, Message> {
         small_button("Aa", "Match case", Some(Message::ToggleSearchCase)),
         small_button(
             "\u{2191}",
-            "Previous (Shift+Enter)",
+            "Previous (Shift+F3)",
             has_matches.then_some(Message::FindPrevious)
         ),
         small_button(
             "\u{2193}",
-            "Next (Enter)",
+            "Next (Enter / F3)",
             has_matches.then_some(Message::FindNext)
         ),
         space::horizontal(),
@@ -245,7 +240,9 @@ pub fn view(search: &Search) -> Element<'_, Message> {
         .spacing(6)
         .align_y(iced::Center);
 
-        iced::widget::column![find_row, replace_row].spacing(6).into()
+        iced::widget::column![find_row, replace_row]
+            .spacing(6)
+            .into()
     } else {
         find_row.into()
     };
@@ -300,9 +297,21 @@ mod tests {
         assert_eq!(
             hits,
             vec![
-                Match { line: 0, start: 4, end: 7 },
-                Match { line: 1, start: 6, end: 9 },
-                Match { line: 3, start: 0, end: 3 },
+                Match {
+                    line: 0,
+                    start: 4,
+                    end: 7
+                },
+                Match {
+                    line: 1,
+                    start: 6,
+                    end: 9
+                },
+                Match {
+                    line: 3,
+                    start: 0,
+                    end: 3
+                },
             ]
         );
     }
@@ -319,8 +328,16 @@ mod tests {
         assert_eq!(
             found("aaaa", "aa", true),
             vec![
-                Match { line: 0, start: 0, end: 2 },
-                Match { line: 0, start: 2, end: 4 },
+                Match {
+                    line: 0,
+                    start: 0,
+                    end: 2
+                },
+                Match {
+                    line: 0,
+                    start: 2,
+                    end: 4
+                },
             ]
         );
     }

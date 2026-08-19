@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  md_editor application icon.
+
+  Scalable only: it is installed to hicolor/scalable/apps, so it must render
+  correctly at every size from 16px up. That rules out text elements (which
+  depend on fonts present on the target machine) and filters (which several
+  panel implementations ignore) — the mark is plain stroked paths.
+
+  Palette matches the editor's default theme (Iced's TokyoNight).
+-->
+<svg xmlns="http://www.w3.org/2000/svg"
+     viewBox="0 0 128 128" width="128" height="128">
+  <title>Markdown Editor</title>
+  <defs>
+    <linearGradient id="surface" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3b4261"/>
+      <stop offset="1" stop-color="#1a1b26"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="4" y="4" width="120" height="120" rx="26" fill="url(#surface)"/>
+  <rect x="4.5" y="4.5" width="119" height="119" rx="25.5"
+        fill="none" stroke="#7aa2f7" stroke-opacity="0.4" stroke-width="1"/>
+
+  <!-- The Markdown mark: an "M" beside a downward arrow. -->
+  <g fill="none" stroke="#c0caf5" stroke-width="10"
+     stroke-linecap="round" stroke-linejoin="round">
+    <path d="M27 86V42l19 22 19-22v44"/>
+    <path d="M90 42v30"/>
+    <path d="M79 63l11 13 11-13"/>
+  </g>
+</svg>

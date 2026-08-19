@@ -1,0 +1,20 @@
+[Desktop Entry]
+Type=Application
+Version=1.5
+Name=Markdown Editor
+GenericName=Markdown Editor
+Comment=Edit Markdown with inline rendering
+Exec=md_editor %f
+TryExec=md_editor
+Icon=md_editor
+Terminal=false
+# Utility is the sole main category on purpose: adding Development as well
+# makes the app show up twice in menus that key off main categories.
+Categories=Utility;TextEditor;
+MimeType=text/markdown;text/x-markdown;
+Keywords=markdown;md;editor;notes;text;
+StartupNotify=true
+# X11 fallback for desktops that match on WM_CLASS instead of the Wayland
+# app_id. Both are set to the basename of this file so the icon binds to the
+# window; see `application_id` in src/main.rs.
+StartupWMClass=md_editor

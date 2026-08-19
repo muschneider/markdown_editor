@@ -1,0 +1,53 @@
+# Maintainer: Mauro Schneider <muschneider@users.noreply.github.com>
+#
+# Build with:  makepkg -si
+#
+# After bumping pkgver, refresh the checksum with `updpkgsums` — the SKIP below
+# is a placeholder so a fresh clone builds, not a licence to ship unverified
+# sources.
+
+pkgname=md_editor
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='A simple Markdown editor with inline rendering, built with Iced'
+arch=('x86_64' 'aarch64')
+url='https://github.com/muschneider/markdown_editor'
+license=('MIT')
+# gtk3 is pulled in by rfd's file dialogs; the rest is what any Rust GUI links.
+depends=('gtk3' 'fontconfig' 'gcc-libs' 'glibc')
+makedepends=('cargo')
+optdepends=('vulkan-icd-loader: GPU rendering (software fallback otherwise)')
+# !lto  — Cargo.toml already sets lto=true; makepkg's C flags do nothing here.
+# !debug — the release profile strips debuginfo, so the debug package is empty.
+options=('!lto' '!debug')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+_srcdir="markdown_editor-$pkgver"
+
+prepare() {
+	cd "$_srcdir"
+	export RUSTUP_TOOLCHAIN=stable
+	cargo fetch --locked --target "$(rustc -vV | sed -n 's/^host: //p')"
+}
+
+build() {
+	cd "$_srcdir"
+	export RUSTUP_TOOLCHAIN=stable
+	export CARGO_TARGET_DIR=target
+	cargo build --frozen --release
+}
+
+check() {
+	cd "$_srcdir"
+	export RUSTUP_TOOLCHAIN=stable
+	cargo test --frozen --release
+}
+
+package() {
+	cd "$_srcdir"
+	# install-files rather than install: the binary is already built, and a
+	# rebuild inside package() would run cargo without --frozen.
+	make DESTDIR="$pkgdir" PREFIX=/usr install-files
+	install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
