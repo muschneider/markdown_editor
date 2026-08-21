@@ -86,7 +86,9 @@ const DOCUMENT_ID: &str = "md-document";
 /// stay horizontally aligned.
 const LINE_PADDING: u16 = 4;
 
-/// Number of lines moved by `PgUp`/`PgDown` (a "page").
+/// Lines moved by `PgUp`/`PgDown` before the scrollable has reported a
+/// viewport. Once it has, [`MarkdownEditor::page_lines`] measures a real page
+/// instead.
 const PAGE_LINES: usize = 15;
 
 /// Rough pixel height of one rendered line at [`settings::BASE_FONT_SIZE`], used
@@ -95,7 +97,15 @@ const PAGE_LINES: usize = 15;
 /// several visual lines — but [`estimate_segment_height`] accounts for wrapping
 /// and [`SCROLL_OVERSCAN_LINES`] absorbs the rest, so a placeholder never shows
 /// on screen.
-const EST_LINE_HEIGHT: f32 = 24.0;
+///
+/// The value is what a body line actually measures: iced lays text out at its
+/// default relative line height (1.3 × 16 px = 20.8 px), and every segment adds
+/// [`LINE_PADDING`] top and bottom plus [`SEGMENT_SPACING`] — 29.8 px in total.
+/// It must stay calibrated: `line_offsets` is compared against, and converted
+/// into, the *real* pixel offsets the scrollable reports, so an estimate that
+/// is off by a fifth drags the render window a screenful away from what is
+/// actually visible and lands every scroll-to-line short of its target.
+const EST_LINE_HEIGHT: f32 = 30.0;
 
 /// Approximate characters per rendered line at [`settings::BASE_FONT_SIZE`],
 /// used to estimate how many visual lines a source line wraps to. Byte length is
@@ -111,7 +121,7 @@ const EST_CHARS_PER_LINE: u32 = 90;
 const EST_CHAR_WIDTH: f32 = 8.0;
 
 /// Extra source lines rendered above and below the visible region as real
-/// elements. At 1080 px tall and 24 px/line ≈ 45 visible lines, 130 lines of
+/// elements. At 1080 px tall and 30 px/line ≈ 36 visible lines, 130 lines of
 /// overscan is ≈ 3 screens on each side: fast scrolling never reveals a
 /// placeholder before the block is built, and the residual height error of the
 /// few real blocks inside the overscan is far too small to reach the viewport.
@@ -612,36 +622,44 @@ impl MarkdownEditor {
                 self.activate_line(self.active_end, column);
                 Task::none()
             }
+            // Unlike the single-line moves above, the page and jump keys can
+            // land far outside the visible region, so they must take the
+            // viewport with them: moving the active line alone leaves the
+            // cursor off screen with the document apparently untouched.
             Message::PageUp => {
                 if self.active_start == 0 {
-                    return Task::none();
+                    // Already on the first line, but the view may still sit
+                    // below it.
+                    return scroll_to_document_start();
                 }
                 let column = self.active_content.cursor().position.column;
-                let target = self.active_start.saturating_sub(PAGE_LINES);
+                let from = self.active_start;
+                let target = from.saturating_sub(self.page_lines());
                 self.activate_line(target, column);
-                Task::none()
+                self.scroll_by_lines(from, target)
             }
             Message::PageDown => {
                 let last = self.lines.len() - 1;
                 if self.active_end > last {
-                    return Task::none();
+                    return scroll_to_document_end();
                 }
                 let column = self.active_content.cursor().position.column;
-                let target = (self.active_start + PAGE_LINES).min(last);
+                let from = self.active_start;
+                let target = (from + self.page_lines()).min(last);
                 self.activate_line(target, column);
-                Task::none()
+                self.scroll_by_lines(from, target)
             }
             Message::JumpToStart => {
                 // Ctrl+Home / Ctrl+PgUp: the very start of the document.
                 self.activate_line(0, 0);
-                Task::none()
+                scroll_to_document_start()
             }
             Message::JumpToEnd => {
                 // Ctrl+End / Ctrl+PgDown: the very end of the document.
                 let last = self.lines.len() - 1;
                 let end_column = self.lines[last].len();
                 self.activate_line(last, end_column);
-                Task::none()
+                scroll_to_document_end()
             }
             Message::LinkClicked(url) => {
                 // Open the link off the UI thread. `webbrowser::open` spawns a
@@ -1454,6 +1472,55 @@ impl MarkdownEditor {
         )
     }
 
+    /// Document lines that fill one screen — how far `PgUp`/`PgDown` move the
+    /// active line.
+    ///
+    /// Measured through `line_offsets` rather than counted as a fixed number of
+    /// lines, so a page is a real page: wrapped paragraphs and larger fonts
+    /// make it shorter, exactly as they make fewer lines fit on screen. It is
+    /// also the geometry [`MarkdownEditor::scroll_by_lines`] scrolls with, so
+    /// the cursor and the viewport travel the same distance and the cursor
+    /// keeps its place on screen.
+    ///
+    /// Spanned across the *visible* region rather than downwards from the
+    /// active line: near the end of the document there are not a screenful of
+    /// lines left below the cursor, and measuring from it would shrink `PgUp`
+    /// to a single line exactly where a full page is wanted.
+    ///
+    /// At least one line, so a page key always moves.
+    fn page_lines(&self) -> usize {
+        let Some((offset_y, view_height)) = self.viewport else {
+            return PAGE_LINES;
+        };
+
+        let first = line_at_offset(&self.line_offsets, offset_y);
+        let last = line_at_offset(&self.line_offsets, offset_y + view_height);
+        last.saturating_sub(first).max(1)
+    }
+
+    /// Estimated top of `line` in content pixels.
+    fn line_top(&self, line: usize) -> f32 {
+        self.line_offsets.get(line).copied().unwrap_or_default()
+    }
+
+    /// Scroll the document by the height of the lines between `from` and `to`,
+    /// so the cursor keeps its place on screen while it moves.
+    ///
+    /// Deliberately *relative*: only the distance travelled comes from the
+    /// estimated `line_offsets`, never the absolute destination, and iced clamps
+    /// the result to the real content. An absolute offset would have to assume
+    /// the estimate matches the rendered layout everywhere above the target,
+    /// where this only assumes it over the lines actually crossed.
+    fn scroll_by_lines(&self, from: usize, to: usize) -> Task<Message> {
+        iced::widget::operation::scroll_by(
+            DOCUMENT_ID,
+            scrollable::AbsoluteOffset {
+                x: 0.0,
+                y: self.line_top(to) - self.line_top(from),
+            },
+        )
+    }
+
     /// Shift every cached segment after the active one by `delta` lines.
     ///
     /// An edit inside the active region can only add or remove lines *within*
@@ -1862,6 +1929,28 @@ impl MarkdownEditor {
     fn focus_active(&self) -> Task<Message> {
         iced::widget::operation::focus(ACTIVE_LINE_ID)
     }
+}
+
+/// Scroll the document to its very top.
+///
+/// A *relative* snap, so it lands on the first pixel of the real content. The
+/// absolute equivalent would have to come from the estimated `line_offsets`,
+/// which is only ever an approximation of the rendered layout.
+fn scroll_to_document_start() -> Task<Message> {
+    snap_document_to(0.0)
+}
+
+/// Scroll the document to its very bottom — see [`scroll_to_document_start`].
+fn scroll_to_document_end() -> Task<Message> {
+    snap_document_to(1.0)
+}
+
+/// Snap the document scrollable to `y`, as a fraction of its scrollable height.
+///
+/// The horizontal offset is pinned at the start rather than taken from
+/// [`scrollable::RelativeOffset::END`], which would also snap sideways.
+fn snap_document_to(y: f32) -> Task<Message> {
+    iced::widget::operation::snap_to(DOCUMENT_ID, scrollable::RelativeOffset { x: 0.0, y })
 }
 
 /// Whether handling `message` can change the set of rendered blocks (the
@@ -2627,35 +2716,114 @@ mod tests {
 
     #[test]
     fn page_and_jump_navigation_moves_the_active_line() {
-        let doc = (0..30)
+        let last = 199;
+        let doc = (0..=last)
             .map(|i| format!("line{i}"))
             .collect::<Vec<_>>()
             .join("\n");
         let (mut editor, _task) = MarkdownEditor::new_with_file(None);
         editor.load_document(&doc);
+        editor.rebuild();
         assert_eq!((editor.active_start, editor.active_end), (0, 1));
 
-        // PgDown moves down one page (PAGE_LINES) from the current line.
-        let _ = editor.update(Message::PageDown);
-        assert_eq!(editor.active_start, PAGE_LINES);
+        // A page is measured from the viewport, so it is a screenful of lines
+        // — not a fixed count, and more than one line.
+        let page = editor.page_lines();
+        assert!(page > 1, "a page must span more than one line");
+        assert!(page < last, "the document must be more than one page long");
 
-        // PgDown again clamps to the last line.
+        // PgDown moves down one page at a time, PgUp back up by the same.
         let _ = editor.update(Message::PageDown);
-        assert_eq!(editor.active_start, 29);
-
-        // At the very bottom PgDown is a no-op.
+        assert_eq!(editor.active_start, page);
         let _ = editor.update(Message::PageDown);
-        assert_eq!(editor.active_start, 29);
-
-        // PgUp moves up one page.
+        assert_eq!(editor.active_start, 2 * page);
         let _ = editor.update(Message::PageUp);
-        assert_eq!(editor.active_start, 29 - PAGE_LINES);
+        assert_eq!(editor.active_start, page);
 
-        // Ctrl+Home / Ctrl+End (and Ctrl+PgUp / Ctrl+PgDown) jump to the ends.
+        // Both clamp at the document's ends instead of running off them, and
+        // are a no-op once there.
+        for _ in 0..=(last / page + 1) {
+            let _ = editor.update(Message::PageDown);
+        }
+        assert_eq!((editor.active_start, editor.active_end), (last, last + 1));
+
+        for _ in 0..=(last / page + 1) {
+            let _ = editor.update(Message::PageUp);
+        }
+        assert_eq!((editor.active_start, editor.active_end), (0, 1));
+
+        // Ctrl+End / Ctrl+Home (and Ctrl+PgDown / Ctrl+PgUp) jump to the ends.
+        let _ = editor.update(Message::JumpToEnd);
+        assert_eq!((editor.active_start, editor.active_end), (last, last + 1));
         let _ = editor.update(Message::JumpToStart);
         assert_eq!((editor.active_start, editor.active_end), (0, 1));
+    }
+
+    /// The page keys must move the *viewport*, not just the active line: the
+    /// cursor moving off screen while the document stays put is exactly the
+    /// "nothing happened" that returning no scroll task produced.
+    #[test]
+    fn a_page_down_scrolls_as_far_as_the_cursor_moves() {
+        let doc = (0..400)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (mut editor, _task) = MarkdownEditor::new_with_file(None);
+        editor.load_document(&doc);
+        editor.rebuild();
+
+        // The emitted `Task` is opaque, so assert on the geometry it is built
+        // from: `scroll_by_lines` scrolls by the height of the lines crossed.
+        let page = editor.page_lines();
+        let scrolled = editor.line_top(page) - editor.line_top(0);
+        assert!(
+            scrolled >= editor.viewport.expect("a seeded viewport").1 * 0.9,
+            "a page down must scroll about a screenful, not {scrolled} px"
+        );
+
+        // The distance travelled is the same one the cursor moves, so the
+        // cursor keeps its place on screen instead of drifting off it.
+        let _ = editor.update(Message::PageDown);
+        assert_eq!(editor.active_start, page);
+        assert_eq!(editor.line_top(editor.active_start), scrolled);
+    }
+
+    /// Without a laid-out viewport there is nothing to measure, so a page falls
+    /// back to a fixed count rather than collapsing to a single line.
+    #[test]
+    fn page_lines_falls_back_without_a_viewport() {
+        let (mut editor, _task) = MarkdownEditor::new_with_file(None);
+        editor.load_document("a\nb\nc");
+        editor.rebuild();
+        editor.viewport = None;
+
+        assert_eq!(editor.page_lines(), PAGE_LINES);
+    }
+
+    /// A page must stay a page at the bottom of the document, where there are
+    /// no longer a screenful of lines below the cursor to measure against.
+    #[test]
+    fn a_page_stays_a_page_at_the_end_of_the_document() {
+        let doc = (0..400)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (mut editor, _task) = MarkdownEditor::new_with_file(None);
+        editor.load_document(&doc);
+        editor.rebuild();
+        let page = editor.page_lines();
+
+        // Scrolled to the bottom, as the scrollable would report it.
+        let total = *editor.line_offsets.last().unwrap();
+        let view_height = editor.viewport.expect("a seeded viewport").1;
+        editor.viewport = Some((total - view_height, view_height));
+
+        assert_eq!(editor.page_lines(), page);
+
         let _ = editor.update(Message::JumpToEnd);
-        assert_eq!((editor.active_start, editor.active_end), (29, 30));
+        let from = editor.active_start;
+        let _ = editor.update(Message::PageUp);
+        assert_eq!(editor.active_start, from - page);
     }
 
     #[test]
