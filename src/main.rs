@@ -6,6 +6,7 @@ mod color_picker;
 mod config;
 mod file_ops;
 mod history;
+mod html;
 mod icons;
 mod markdown_view;
 mod search;

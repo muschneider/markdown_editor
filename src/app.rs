@@ -22,17 +22,17 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use iced::keyboard;
 use iced::widget::{
     Column, button, column, container, markdown, mouse_area, pick_list, row, scrollable, space,
     text, text_editor,
 };
-use iced::{Element, Fill, Font, Length, Subscription, Task, Theme, window};
+use iced::{Element, Fill, Font, Length, Subscription, Task, Theme, keyboard, mouse, window};
 
 use crate::color_picker;
 use crate::config::{self, Config};
 use crate::file_ops::{self, FileError};
 use crate::history::{self, History};
+use crate::html;
 use crate::icons;
 use crate::markdown_view;
 use crate::search::{self, Search};
@@ -60,6 +60,13 @@ Just start typing. Click anywhere to move the cursor there.
 | `Home`  `End`       | start / end of line           |
 | `PgUp`  `PgDn`      | move a page                   |
 | `Ctrl+Home`  `Ctrl+End` | start / end of document   |
+| `Ctrl+A`            | select everything             |
+| `Shift+←/→/↑/↓`     | extend the selection          |
+| `Ctrl+Shift+Home/End` | select to the document edge |
+| `Ctrl+C X V`        | copy / cut / paste            |
+| `Ctrl+Backspace`  `Ctrl+Delete` | delete a word     |
+
+Select across lines by dragging too — then copy, cut or type over it.
 
 ## Markdown
 
@@ -188,6 +195,18 @@ pub struct MarkdownEditor {
     active_end: usize,
     /// Editable content for the active range (one or more lines joined by `\n`).
     active_content: text_editor::Content,
+    /// Whether the raw range was widened to hold a **selection** rather than
+    /// because the cursor sits in a table.
+    ///
+    /// A selection is only ever drawn — and only ever copied, cut or replaced —
+    /// by the `text_editor`, which knows nothing of the document outside its
+    /// own range. So a selection that reaches past the cursor's line drags the
+    /// raw range along with it (see [`MarkdownEditor::reshape_region`]). This
+    /// flag remembers *why* the range is wide, so it can shrink back to a
+    /// single line the moment the selection is gone — a table's range must not.
+    selection_region: bool,
+    /// The in-progress mouse selection drag, if any.
+    drag: Option<Drag>,
     /// Path to the currently open file, if any.
     current_file: Option<PathBuf>,
     /// Whether the document has unsaved changes.
@@ -319,6 +338,16 @@ pub enum Message {
     /// height (px), used to window the rendered blocks so only those near the
     /// viewport are built into the widget tree.
     Scrolled { offset_y: f32, view_height: f32 },
+    /// Select the whole document (`Ctrl/Cmd+A`).
+    SelectAll,
+    /// Extend the selection by a motion that runs past the raw region's edge,
+    /// widening the region so the selection can continue into the document.
+    ExtendSelection(text_editor::Motion),
+    /// The mouse was dragged over the rendered line at this index with the
+    /// button held: extend the selection to it.
+    DragTo(usize),
+    /// The mouse button was released, ending any selection drag.
+    DragEnd,
 }
 
 /// Theme the editor starts with.
@@ -377,12 +406,30 @@ impl Gap {
     }
 }
 
+/// A mouse selection drag in progress.
+///
+/// Held from the press that started it until the button is released, which is
+/// what turns a mouse *move* over a rendered line into a selection instead of
+/// plain hovering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Drag {
+    /// Where the drag began, as a `(document line, byte column)` pair. It is
+    /// the fixed end of the selection; the pointer moves the other one.
+    anchor: (usize, usize),
+}
+
 /// Cursor and region context handed to the active editor's key bindings, so
 /// they can decide whether a key edits within the region or leaves it.
 #[derive(Clone, Copy, Default)]
 struct BindingContext {
     /// The raw region spans more than one line (i.e. an entire table).
     multiline: bool,
+    /// Some text is selected.
+    ///
+    /// Selection changes what several keys mean: `Backspace`/`Delete` remove
+    /// the selection instead of a character or a line break, `Enter` replaces
+    /// it, and `Copy`/`Cut` only have something to do when it is set.
+    has_selection: bool,
     /// The cursor is on the first visual line of the editor.
     at_editor_top: bool,
     /// The cursor is on the last visual line of the editor.
@@ -429,6 +476,8 @@ impl MarkdownEditor {
             active_start: 0,
             active_end: 1,
             active_content: text_editor::Content::with_text(""),
+            selection_region: false,
+            drag: None,
             current_file: None,
             is_dirty: false,
             is_loading: false,
@@ -513,7 +562,11 @@ impl MarkdownEditor {
 
         let task = self.handle(message);
 
-        if needs_rebuild {
+        // A region widened to hold a selection shrinks back as soon as the
+        // selection is gone, so no more of the document stays raw than has to.
+        let collapsed = self.collapse_selection_region();
+
+        if needs_rebuild || collapsed {
             self.rebuild();
         }
         if touches_document {
@@ -526,8 +579,32 @@ impl MarkdownEditor {
     fn handle(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::EditorAction(action) => {
+                // Rich text copied from a browser or a word processor reaches
+                // the clipboard's plain-text flavour as raw markup; dropping
+                // `<p>` and `<strong>` into a Markdown document is never what
+                // the user meant, so it is converted on the way in.
+                let action = match action {
+                    text_editor::Action::Edit(text_editor::Edit::Paste(text))
+                        if html::looks_like_html(&text) =>
+                    {
+                        text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(
+                            html::to_markdown(&text),
+                        )))
+                    }
+                    action => action,
+                };
+
                 let is_edit = action.is_edit();
+                // A press inside the editor also anchors a selection drag, so
+                // it can carry on over the rendered lines around it.
+                let is_click = matches!(action, text_editor::Action::Click(_));
                 self.active_content.perform(action);
+
+                if is_click {
+                    self.drag = Some(Drag {
+                        anchor: self.cursor_position(),
+                    });
+                }
 
                 if is_edit {
                     self.is_dirty = true;
@@ -539,14 +616,29 @@ impl MarkdownEditor {
                 Task::none()
             }
             Message::Activate(index) => {
+                if index >= self.lines.len() {
+                    return self.focus_active();
+                }
+
                 // A click always targets a line outside the current raw region
                 // (rendered blocks/blanks only); guard against redundant resets.
-                if index < self.lines.len()
-                    && (index < self.active_start || index >= self.active_end)
-                {
+                if index < self.active_start || index >= self.active_end {
                     self.activate_line(index, 0);
                 }
+                // Pressing is also how a drag-selection starts. Releasing
+                // without moving leaves the cursor placed and nothing selected,
+                // which is exactly what a plain click should do.
+                self.drag = Some(Drag {
+                    anchor: self.cursor_position(),
+                });
                 self.focus_active()
+            }
+            Message::SelectAll => self.select_all(),
+            Message::ExtendSelection(motion) => self.extend_selection(motion),
+            Message::DragTo(line) => self.drag_to(line),
+            Message::DragEnd => {
+                self.drag = None;
+                Task::none()
             }
             Message::SplitLine => {
                 // Only emitted for a single-line region, so the editor text is
@@ -1088,6 +1180,7 @@ impl MarkdownEditor {
             .unwrap_or(0);
         let ctx = BindingContext {
             multiline: self.active_end - self.active_start > 1,
+            has_selection: self.has_selection(),
             at_editor_top: cursor.position.line == 0,
             at_editor_bottom: cursor.position.line + 1 >= self.active_content.line_count(),
             at_line_start: cursor.position.column == 0,
@@ -1114,6 +1207,12 @@ impl MarkdownEditor {
         // window already covers every line, or tests with no real layout) the
         // window is `None` and the whole document renders.
         let window = visible_line_window(self.viewport, &self.line_offsets, self.lines.len());
+
+        // The rendered lines only listen for the pointer *entering* them while
+        // a drag is actually under way. Wiring it unconditionally would post a
+        // message on every mouse move across the document — a full `update`
+        // per hovered line, for nothing.
+        let dragging = self.drag.is_some();
 
         let mut block_index = 0;
         let mut before: Vec<Element<'_, Message>> = Vec::new();
@@ -1188,15 +1287,14 @@ impl MarkdownEditor {
                 Segment::Blank(index) => {
                     // A space keeps the empty line clickable and gives the
                     // document natural paragraph spacing.
-                    target.push(
-                        mouse_area(
-                            container(text(" ").font(Font::MONOSPACE).size(font_size))
-                                .width(Fill)
-                                .padding(LINE_PADDING),
-                        )
-                        .on_press(Message::Activate(*index))
-                        .into(),
-                    );
+                    target.push(selectable(
+                        container(text(" ").font(Font::MONOSPACE).size(font_size))
+                            .width(Fill)
+                            .padding(LINE_PADDING)
+                            .into(),
+                        *index,
+                        dragging,
+                    ));
                 }
                 Segment::Block { start, end } => {
                     // `block_index` tracks every Block segment (rendered or not)
@@ -1215,11 +1313,11 @@ impl MarkdownEditor {
                     };
                     block_index += 1;
 
-                    target.push(
-                        mouse_area(container(body).width(Fill).padding(LINE_PADDING))
-                            .on_press(Message::Activate(*start))
-                            .into(),
-                    );
+                    target.push(selectable(
+                        container(body).width(Fill).padding(LINE_PADDING).into(),
+                        *start,
+                        dragging,
+                    ));
                 }
             }
         }
@@ -1356,39 +1454,18 @@ impl MarkdownEditor {
         self.search.is_some() || self.show_settings_panel || self.show_color_panel
     }
 
-    /// Keyboard handling that cannot go through the focused widget.
+    /// Events that cannot go through the focused widget.
     ///
-    /// Only active while a panel that `Esc` should close is open. `text_input`
-    /// swallows `Esc` (to unfocus itself) and fires `on_submit` for `Enter`
-    /// regardless of modifiers, so neither can be bound from the widget side;
-    /// `F3` is left alone by every widget involved. With everything closed
-    /// there is no listener at all, so ordinary editing never pays for one.
+    /// Both listeners below are installed only while something actually needs
+    /// them, so ordinary editing never pays for one.
     pub fn subscription(&self) -> Subscription<Message> {
-        if !self.needs_key_listener() {
-            return Subscription::none();
-        }
+        let panels = self.needs_key_listener().then(panel_keys);
+        // The button can be released anywhere — over another widget, or outside
+        // the window entirely — and no widget would report that, so the end of
+        // a drag has to be watched for globally.
+        let drag = self.drag.is_some().then(mouse_release);
 
-        // `listen_with` takes a plain `fn`, so this closure must not capture:
-        // which panel `Esc` closes is decided by [`Message::Dismiss`] in
-        // `handle`, not here. `F3` is safe to emit unconditionally — stepping
-        // matches with no search open is a no-op.
-        iced::event::listen_with(|event, _status, _window| {
-            use keyboard::key::Named;
-
-            let iced::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) = event
-            else {
-                return None;
-            };
-
-            match key.as_ref() {
-                // Deliberately handled even when a widget consumed the event:
-                // while a panel is open, `Esc` can only mean "close it".
-                keyboard::Key::Named(Named::Escape) => Some(Message::Dismiss),
-                keyboard::Key::Named(Named::F3) if modifiers.shift() => Some(Message::FindPrevious),
-                keyboard::Key::Named(Named::F3) => Some(Message::FindNext),
-                _ => None,
-            }
-        })
+        Subscription::batch(panels.into_iter().chain(drag))
     }
 
     /// Replace the whole document with `text`, resetting the active region.
@@ -1468,6 +1545,42 @@ impl MarkdownEditor {
             scrollable::AbsoluteOffset {
                 x: 0.0,
                 y: (top - view_height / 3.0).max(0.0),
+            },
+        )
+    }
+
+    /// Scroll `line` into view, but only as far as it takes.
+    ///
+    /// Unlike [`MarkdownEditor::scroll_to_line`], which re-centres the
+    /// document a third of the way down, this moves the viewport by the
+    /// smallest amount that puts `line` on screen — and not at all when it
+    /// already is. Extending a selection one line at a time must not make the
+    /// document jump under the cursor.
+    fn reveal_line(&self, line: usize) -> Task<Message> {
+        let Some((offset_y, view_height)) = self.viewport else {
+            return Task::none();
+        };
+
+        let top = self.line_top(line);
+        let bottom = self
+            .line_offsets
+            .get(line + 1)
+            .copied()
+            .unwrap_or(top + self.metrics().line_height);
+
+        let target = if top < offset_y {
+            top
+        } else if bottom > offset_y + view_height {
+            bottom - view_height
+        } else {
+            return Task::none();
+        };
+
+        iced::widget::operation::scroll_to(
+            DOCUMENT_ID,
+            scrollable::AbsoluteOffset {
+                x: 0.0,
+                y: target.max(0.0),
             },
         )
     }
@@ -1652,6 +1765,10 @@ impl MarkdownEditor {
     }
 
     fn set_active(&mut self, line: usize, column: usize, may_reuse: bool) {
+        // Placing the cursor somewhere ends any selection, and with it the
+        // only reason the region might have been widened past the cursor line.
+        self.selection_region = false;
+
         let (start, end) = active_bounds(&self.lines, line);
 
         // Moving somewhere else ends the current run of edits, so the next one
@@ -1682,6 +1799,10 @@ impl MarkdownEditor {
         if reuse_content {
             // The content already holds the correct text; just move the cursor.
             // Always call `move_to` because the cursor is at its old position.
+            // It cannot *clear* a selection though (`Cursor::selection: None`
+            // means "leave it alone", not "drop it"), so an old selection is
+            // collapsed first — placing the cursor must never leave one behind.
+            self.clear_selection();
             self.active_content.move_to(text_editor::Cursor {
                 position: text_editor::Position {
                     line: editor_line,
@@ -1702,6 +1823,298 @@ impl MarkdownEditor {
                 });
             }
         }
+    }
+
+    /// Whether any text is selected.
+    ///
+    /// Asked from `view` on every frame and from `update` on every message, so
+    /// it deliberately goes through the cursor rather than through
+    /// [`text_editor::Content::selection`] — the latter *materializes* the
+    /// selected text, which after `Ctrl+A` means copying the entire document
+    /// once per frame.
+    ///
+    /// A *degenerate* selection (both ends at the same position) is rejected:
+    /// it reads back as an empty string rather than as "nothing selected", and
+    /// `Ctrl+C` must never overwrite the clipboard with `""`.
+    fn has_selection(&self) -> bool {
+        let cursor = self.active_content.cursor();
+
+        match cursor.selection {
+            None => false,
+            // The ordinary case is decided from the two ends alone, without
+            // touching the text.
+            Some(anchor) if anchor != cursor.position => true,
+            // A word- or line-selection (a double or triple click) reports the
+            // click position as *both* of its ends, so only the text can say
+            // whether anything is actually selected. Neither spans more than a
+            // line, so this stays cheap.
+            Some(_) => self
+                .active_content
+                .selection()
+                .is_some_and(|text| !text.is_empty()),
+        }
+    }
+
+    /// Drop any selection, leaving the cursor at the end it started from.
+    ///
+    /// [`text_editor::Content::move_to`] can only ever *set* a selection, so
+    /// clearing one goes through a motion instead: performing a `Move` with a
+    /// selection present discards it and keeps one of its ends, without moving
+    /// the cursor any further.
+    ///
+    /// Degenerate selections count here (unlike in
+    /// [`MarkdownEditor::has_selection`]): leaving one behind would make the
+    /// editor report an empty string as its selection.
+    fn clear_selection(&mut self) {
+        if self.active_content.cursor().selection.is_some() {
+            self.active_content
+                .perform(text_editor::Action::Move(text_editor::Motion::Left));
+        }
+    }
+
+    /// The selection as `(anchor, cursor)` in `(document line, byte column)`
+    /// pairs. With nothing selected both ends are the cursor.
+    ///
+    /// The anchor is the end that stays put while the selection is extended;
+    /// the cursor is the end the keyboard and the mouse move.
+    fn selection_span(&self) -> ((usize, usize), (usize, usize)) {
+        let cursor = self.active_content.cursor();
+        let head = (
+            self.active_start + cursor.position.line,
+            cursor.position.column,
+        );
+
+        let Some(anchor) = cursor.selection else {
+            return (head, head);
+        };
+        let anchor = (self.active_start + anchor.line, anchor.column);
+
+        if anchor != head {
+            return (anchor, head);
+        }
+
+        // Both ends at once means a word- or line-selection: a double or
+        // triple click stores the *click* position as its anchor and leaves
+        // the real extent implicit. Neither can span more than one line, so
+        // the range is recovered by locating the selected text on it — and,
+        // as in every other editor, extending it afterwards keeps its start
+        // and moves its end.
+        match self.active_content.selection() {
+            Some(text) if !text.is_empty() && head.0 < self.lines.len() => {
+                let start = selection_start_column(&self.lines[head.0], head.1, &text);
+                ((head.0, start), (head.0, start + text.len()))
+            }
+            _ => (head, head),
+        }
+    }
+
+    /// Translate a document position into one inside the active editor,
+    /// clamped to the region and to a character boundary.
+    fn editor_position(&self, (line, column): (usize, usize)) -> text_editor::Position {
+        let line = line.clamp(self.active_start, self.active_end - 1);
+
+        text_editor::Position {
+            line: line - self.active_start,
+            column: clamp_column(&self.lines[line], column),
+        }
+    }
+
+    /// Widen the raw region to cover at least `start..end` and select from
+    /// `anchor` to `head` (both in document coordinates) inside it.
+    ///
+    /// This is what makes a selection a *document* selection: the
+    /// `text_editor` can only draw, copy or replace text it actually holds, so
+    /// every line the selection touches is pulled into the raw region. Nothing
+    /// else has to understand selection — copy, cut, paste and delete all keep
+    /// working exactly as they do on a single line.
+    ///
+    /// The range is snapped outwards to whole tables, so a selection that ends
+    /// halfway down one does not leave the remaining rows rendering as an
+    /// invalid fragment.
+    fn reshape_region(
+        &mut self,
+        start: usize,
+        end: usize,
+        anchor: (usize, usize),
+        head: (usize, usize),
+    ) {
+        let last = self.lines.len() - 1;
+        let start = active_bounds(&self.lines, start.min(last)).0;
+        let end = active_bounds(&self.lines, end.clamp(start + 1, last + 1) - 1).1;
+
+        // Changing the selection is a deliberate move to somewhere else, so
+        // the next edit starts its own undo step rather than being folded into
+        // whatever was being typed before.
+        self.history.break_run();
+
+        if start != self.active_start || end != self.active_end {
+            // Rebuilding drops the widget's highlighter cache, so it is only
+            // done when the text the editor holds actually changes.
+            if !content_matches(&self.active_content, &self.lines[start..end]) {
+                self.active_content =
+                    text_editor::Content::with_text(&self.lines[start..end].join("\n"));
+            }
+
+            self.active_start = start;
+            self.active_end = end;
+        }
+
+        self.selection_region = true;
+
+        let position = self.editor_position(head);
+        let selection = self.editor_position(anchor);
+
+        // Collapsing the two ends onto each other has to go through
+        // `clear_selection`: a `Cursor` whose selection equals its position is
+        // an *empty* selection, not the absence of one.
+        self.clear_selection();
+        self.active_content.move_to(text_editor::Cursor {
+            position,
+            selection: (selection != position).then_some(selection),
+        });
+    }
+
+    /// Select the entire document (`Ctrl/Cmd+A`).
+    ///
+    /// The whole document becomes the raw region, which is what makes the
+    /// selection visible and lets one `Ctrl+C`, `Ctrl+X` or keystroke act on
+    /// all of it.
+    fn select_all(&mut self) -> Task<Message> {
+        let last = self.lines.len() - 1;
+        self.reshape_region(0, self.lines.len(), (0, 0), (last, self.lines[last].len()));
+
+        // The viewport deliberately stays where it is: no editor scrolls the
+        // document away on "select all".
+        Task::none()
+    }
+
+    /// Extend the selection by `motion`, widening the raw region far enough
+    /// for the motion to land inside it.
+    ///
+    /// Only the motions that would run *past* the region's edge come here; a
+    /// selection that stays within it is handled by the editor itself. The
+    /// motion is still performed by the editor once the region has grown, so
+    /// wrapped lines, word boundaries and the caret's preferred column all
+    /// behave exactly as they do on a single line.
+    fn extend_selection(&mut self, motion: text_editor::Motion) -> Task<Message> {
+        use text_editor::Motion;
+
+        let (anchor, head) = self.selection_span();
+
+        // A page is a property of the *document's* viewport, not of the small
+        // editor holding the raw region — whose own idea of a page is however
+        // many lines it currently contains, and which has not even been laid
+        // out at its new size yet. So the page motions are resolved here, in
+        // document coordinates, and applied as a position.
+        if let Some(target) = self.page_target(motion, head) {
+            self.reshape_region(
+                self.active_start.min(target.0),
+                self.active_end.max(target.0 + 1),
+                anchor,
+                target,
+            );
+            return self.reveal_line(target.0);
+        }
+
+        let (start, end) = match motion {
+            Motion::DocumentStart => (0, self.active_end),
+            Motion::DocumentEnd => (self.active_start, self.lines.len()),
+            // One line is enough for the character, word and vertical motions:
+            // none can cross more than a single line break at a time.
+            Motion::Up | Motion::Left | Motion::WordLeft | Motion::Home => {
+                (self.active_start.saturating_sub(1), self.active_end)
+            }
+            Motion::Down | Motion::Right | Motion::WordRight | Motion::End => (
+                self.active_start,
+                (self.active_end + 1).min(self.lines.len()),
+            ),
+            Motion::PageUp | Motion::PageDown => unreachable!("resolved above"),
+        };
+
+        self.reshape_region(start, end, anchor, head);
+        // The editor performs the motion itself, so wrapped lines, word
+        // boundaries and the caret's preferred column all behave exactly as
+        // they do inside a single line.
+        self.active_content
+            .perform(text_editor::Action::Select(motion));
+
+        let (_, head) = self.selection_span();
+        self.reveal_line(head.0)
+    }
+
+    /// Where a page motion lands, in document coordinates, or `None` when
+    /// `motion` is not one.
+    fn page_target(
+        &self,
+        motion: text_editor::Motion,
+        head: (usize, usize),
+    ) -> Option<(usize, usize)> {
+        let page = self.page_lines();
+
+        let line = match motion {
+            text_editor::Motion::PageUp => head.0.saturating_sub(page),
+            text_editor::Motion::PageDown => (head.0 + page).min(self.lines.len() - 1),
+            _ => return None,
+        };
+
+        Some((line, head.1))
+    }
+
+    /// Extend a mouse drag-selection to the rendered line at `line`.
+    fn drag_to(&mut self, line: usize) -> Task<Message> {
+        let Some(drag) = self.drag else {
+            return Task::none();
+        };
+        if line >= self.lines.len() {
+            return Task::none();
+        }
+
+        // Rendered Markdown carries no mapping from a pixel back to a column —
+        // the glyphs on screen are not the source characters — so a line the
+        // drag has reached is taken whole: down to its end when the pointer is
+        // below the anchor, back to its start when above.
+        let head = if line >= drag.anchor.0 {
+            (line, self.lines[line].len())
+        } else {
+            (line, 0)
+        };
+
+        self.reshape_region(
+            drag.anchor.0.min(line),
+            drag.anchor.0.max(line) + 1,
+            drag.anchor,
+            head,
+        );
+
+        // Keep the moving end of the selection on screen, so a drag towards
+        // the edge of the window carries on scrolling the document.
+        self.reveal_line(line)
+    }
+
+    /// Shrink a selection-widened region back onto the cursor's line once the
+    /// selection is gone, reporting whether the region changed.
+    ///
+    /// Without this the region would only ever grow: one `Shift+Down` too many
+    /// would leave half the document rendering as raw source for the rest of
+    /// the session.
+    fn collapse_selection_region(&mut self) -> bool {
+        // The overwhelmingly common case — ordinary typing and navigation —
+        // costs one boolean test.
+        if !self.selection_region || self.drag.is_some() || self.has_selection() {
+            return false;
+        }
+
+        let (line, column) = self.cursor_position();
+        let line = line.min(self.lines.len() - 1);
+        let (start, end) = active_bounds(&self.lines, line);
+
+        self.selection_region = false;
+        if start == self.active_start && end == self.active_end {
+            return false;
+        }
+
+        self.set_active(line, column, false);
+        true
     }
 
     /// Write the active editor's text back into `lines`.
@@ -1931,6 +2344,62 @@ impl MarkdownEditor {
     }
 }
 
+/// `Esc` and `F3`, handled outside the focused widget.
+///
+/// `text_input` swallows `Esc` (to unfocus itself) and fires `on_submit` for
+/// `Enter` regardless of modifiers, so neither can be bound from the widget
+/// side; `F3` is left alone by every widget involved.
+fn panel_keys() -> Subscription<Message> {
+    // `listen_with` takes a plain `fn`, so this closure must not capture: which
+    // panel `Esc` closes is decided by [`Message::Dismiss`] in `handle`, not
+    // here. `F3` is safe to emit unconditionally — stepping matches with no
+    // search open is a no-op.
+    iced::event::listen_with(|event, _status, _window| {
+        use keyboard::key::Named;
+
+        let iced::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) = event
+        else {
+            return None;
+        };
+
+        match key.as_ref() {
+            // Deliberately handled even when a widget consumed the event:
+            // while a panel is open, `Esc` can only mean "close it".
+            keyboard::Key::Named(Named::Escape) => Some(Message::Dismiss),
+            keyboard::Key::Named(Named::F3) if modifiers.shift() => Some(Message::FindPrevious),
+            keyboard::Key::Named(Named::F3) => Some(Message::FindNext),
+            _ => None,
+        }
+    })
+}
+
+/// The left mouse button being released, which ends a selection drag.
+fn mouse_release() -> Subscription<Message> {
+    iced::event::listen_with(|event, _status, _window| match event {
+        iced::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+            Some(Message::DragEnd)
+        }
+        _ => None,
+    })
+}
+
+/// Wrap a rendered segment so the pointer can reach the document through it.
+///
+/// Pressing it puts the cursor on `line`; while `dragging`, the pointer
+/// *entering* it extends the selection to that line. `on_enter` is only
+/// attached during a drag because it fires on plain hovering too, and a
+/// message per hovered line would run a full update cycle for every mouse
+/// move across the document.
+fn selectable<'a>(body: Element<'a, Message>, line: usize, dragging: bool) -> Element<'a, Message> {
+    let area = mouse_area(body).on_press(Message::Activate(line));
+
+    if dragging {
+        area.on_enter(Message::DragTo(line)).into()
+    } else {
+        area.into()
+    }
+}
+
 /// Scroll the document to its very top.
 ///
 /// A *relative* snap, so it lands on the first pixel of the real content. The
@@ -2010,8 +2479,13 @@ fn message_affects_blocks(message: &Message) -> bool {
         | Message::FindPrevious
         | Message::ReplaceCurrent
         | Message::ReplaceAll
-        | Message::OpenSearch { .. } => false,
-        // Everything else may change the document or the active region.
+        | Message::OpenSearch { .. }
+        // Releasing the mouse only forgets the drag anchor; the selection it
+        // produced is already in place.
+        | Message::DragEnd => false,
+        // Everything else may change the document or the active region —
+        // including the selection messages, which widen the raw region and so
+        // change which lines are rendered as Markdown.
         _ => true,
     }
 }
@@ -2277,6 +2751,20 @@ fn split_lines(text: &str) -> Vec<String> {
     text.split('\n').map(String::from).collect()
 }
 
+/// Column at which a word- or line-selection of `text` begins on `line`.
+///
+/// Such a selection only records the position that was clicked, which sits
+/// *somewhere inside* it — so the start is found by looking for the occurrence
+/// of the selected text that covers that position. At most `text.len()`
+/// candidates are tried, and only the ones that are character boundaries.
+fn selection_start_column(line: &str, column: usize, text: &str) -> usize {
+    let column = column.min(line.len());
+
+    (column.saturating_sub(text.len())..=column)
+        .find(|&start| line.is_char_boundary(start) && line[start..].starts_with(text))
+        .unwrap_or(column)
+}
+
 /// Clamp a byte `column` to the length of `line`, snapping to the nearest
 /// char boundary at or below it.
 fn clamp_column(line: &str, column: usize) -> usize {
@@ -2295,24 +2783,38 @@ fn clamp_column(line: &str, column: usize) -> usize {
 /// - **Enter** splits a standalone line (adds a table row inside a table).
 /// - **Backspace** at column 0 merges into the previous line.
 /// - **Delete** at end of line merges the next line up.
+/// - **Ctrl/Opt+Backspace / Ctrl/Opt+Delete** delete the word beside the cursor.
 /// - **↑/↓** move between lines from the region's top/bottom edge.
+/// - **Shift+↑/↓/←/→**, **Shift+PgUp/PgDn** and **Ctrl/Cmd+Shift+Home/End/↑/↓**
+///   extend the selection past the region, growing it to match.
 /// - **PgUp/PgDn** move the active line by a page; **Ctrl+Home/End** (and
 ///   **Ctrl+PgUp/PgDn**) jump to the document start/end.
+/// - **Ctrl+A** selects the whole document.
 /// - **Ctrl+N/O/S** file actions, **Ctrl+Z / Ctrl+Y** undo/redo,
 ///   **Ctrl+B / Ctrl+I** bold/italic.
 ///
-/// Everything else (Home/End, Ctrl+←/→ word motion, Ctrl+C/X/V/A, typing)
-/// falls through to the default editor bindings, which operate within the
-/// active region.
+/// Everything else falls through to the default editor bindings, which operate
+/// *within* the active region — and since the region always covers the whole
+/// selection, that is enough for Home/End, word motion, typing, and
+/// `Ctrl+C`/`X`/`V` to behave exactly as they would in a plain text editor.
 fn editor_binding(
     key_press: text_editor::KeyPress,
     ctx: BindingContext,
 ) -> Option<text_editor::Binding<Message>> {
     use keyboard::key::Named;
+    use text_editor::{Binding, Motion};
 
     let key = key_press.key.clone();
-    let command = key_press.modifiers.command();
-    let shift = key_press.modifiers.shift();
+    let modifiers = key_press.modifiers;
+    let command = modifiers.command();
+    let shift = modifiers.shift();
+    // `Ctrl` on Windows/Linux, `Option` on macOS: the "by word" modifier.
+    let by_word = modifiers.jump();
+    // On macOS `Cmd+←/→` means start/end of line, not a word motion, so those
+    // combinations never leave the region and must not be intercepted here.
+    let line_motion = modifiers.macos_command();
+
+    let extend = |motion| Some(Binding::Custom(Message::ExtendSelection(motion)));
 
     // Application shortcuts. Matched on the *unmodified* key so they keep
     // working on keyboard layouts where a modifier changes the produced
@@ -2329,67 +2831,166 @@ fn editor_binding(
             "y" => Some(Message::Redo),
             "f" => Some(Message::OpenSearch { replace: false }),
             "h" => Some(Message::OpenSearch { replace: true }),
+            // Select the *document*, not just the raw region the editor holds.
+            "a" => Some(Message::SelectAll),
             // The only way back once the toolbar is hidden.
             "," => Some(Message::ToggleSettingsPanel),
             _ => None,
         };
 
         if let Some(message) = message {
-            return Some(text_editor::Binding::Custom(message));
+            return Some(Binding::Custom(message));
+        }
+
+        // Copy and cut with nothing selected must leave both the clipboard and
+        // the document alone. The default binding would hand the widget an
+        // empty selection to write, wiping whatever was on the clipboard.
+        if matches!(c, "c" | "x") && !ctx.has_selection {
+            return Some(Binding::Sequence(Vec::new()));
         }
     }
 
     match key.as_ref() {
-        // Enter on a standalone line splits it into a new document line; inside a
-        // table it falls through to insert a newline (i.e. add a row).
-        keyboard::Key::Named(Named::Enter) if !ctx.multiline => {
-            Some(text_editor::Binding::Custom(Message::SplitLine))
+        // -- Selection that runs past the raw region ---------------------
+        //
+        // Only the motions that would leave the region are intercepted; the
+        // rest are the editor's own and already do the right thing, because
+        // the region always spans the entire selection.
+        //
+        // `Ctrl/Cmd+Shift` with a vertical key or Home/End selects all the way
+        // to the document's edge, matching the platform convention on macOS
+        // and the `Ctrl+Shift+Home/End` every other desktop shares.
+        keyboard::Key::Named(Named::Home | Named::ArrowUp) if shift && command => {
+            extend(Motion::DocumentStart)
+        }
+        keyboard::Key::Named(Named::End | Named::ArrowDown) if shift && command => {
+            extend(Motion::DocumentEnd)
+        }
+        keyboard::Key::Named(Named::ArrowUp) if shift && ctx.at_editor_top && !ctx.at_doc_first => {
+            extend(Motion::Up)
+        }
+        keyboard::Key::Named(Named::ArrowDown)
+            if shift && ctx.at_editor_bottom && !ctx.at_doc_last =>
+        {
+            extend(Motion::Down)
+        }
+        keyboard::Key::Named(Named::ArrowLeft)
+            if shift
+                && !line_motion
+                && ctx.at_editor_top
+                && ctx.at_line_start
+                && !ctx.at_doc_first =>
+        {
+            extend(if by_word {
+                Motion::WordLeft
+            } else {
+                Motion::Left
+            })
+        }
+        keyboard::Key::Named(Named::ArrowRight)
+            if shift
+                && !line_motion
+                && ctx.at_editor_bottom
+                && ctx.at_line_end
+                && !ctx.at_doc_last =>
+        {
+            extend(if by_word {
+                Motion::WordRight
+            } else {
+                Motion::Right
+            })
+        }
+        keyboard::Key::Named(Named::PageUp) if shift => extend(Motion::PageUp),
+        keyboard::Key::Named(Named::PageDown) if shift => extend(Motion::PageDown),
+
+        // -- Word deletion ----------------------------------------------
+        //
+        // Not something the widget offers: its `Backspace` is always one
+        // character. Selecting the word first and deleting the selection is
+        // exactly how every editor implements it, and makes it a single,
+        // reversible edit. With text already selected the word motion would
+        // throw that selection away, so the plain deletion is used instead.
+        keyboard::Key::Named(Named::Backspace) if by_word && !ctx.has_selection => {
+            if ctx.at_editor_top && ctx.at_line_start {
+                // No word to the left inside the region: the line break before
+                // it is what gets deleted, joining the two lines.
+                return (!ctx.at_doc_first).then_some(Binding::Custom(Message::MergeWithPrevious));
+            }
+            Some(Binding::Sequence(vec![
+                Binding::Select(Motion::WordLeft),
+                Binding::Backspace,
+            ]))
+        }
+        keyboard::Key::Named(Named::Delete) if by_word && !ctx.has_selection => {
+            if ctx.at_editor_bottom && ctx.at_line_end {
+                return (!ctx.at_doc_last).then_some(Binding::Custom(Message::MergeWithNext));
+            }
+            Some(Binding::Sequence(vec![
+                Binding::Select(Motion::WordRight),
+                Binding::Delete,
+            ]))
+        }
+
+        // -- Editing at the region's edges -------------------------------
+        //
+        // Each of these only applies with *nothing* selected: a selection is
+        // what the key acts on, and the editor already holds all of it.
+        //
+        // Enter on a standalone line splits it into a new document line; inside
+        // a table it falls through to insert a newline (i.e. add a row).
+        keyboard::Key::Named(Named::Enter) if !ctx.multiline && !ctx.has_selection => {
+            Some(Binding::Custom(Message::SplitLine))
         }
         // Backspace at the very start of the region merges into the line above;
         // elsewhere it edits within the editor (including joining table rows).
         keyboard::Key::Named(Named::Backspace)
-            if ctx.at_editor_top && ctx.at_line_start && !ctx.at_doc_first =>
+            if ctx.at_editor_top
+                && ctx.at_line_start
+                && !ctx.at_doc_first
+                && !ctx.has_selection =>
         {
-            Some(text_editor::Binding::Custom(Message::MergeWithPrevious))
+            Some(Binding::Custom(Message::MergeWithPrevious))
         }
         // Delete at the very end of the region pulls the next line up; elsewhere
         // it deletes forward within the editor.
         keyboard::Key::Named(Named::Delete)
-            if ctx.at_editor_bottom && ctx.at_line_end && !ctx.at_doc_last =>
+            if ctx.at_editor_bottom
+                && ctx.at_line_end
+                && !ctx.at_doc_last
+                && !ctx.has_selection =>
         {
-            Some(text_editor::Binding::Custom(Message::MergeWithNext))
+            Some(Binding::Custom(Message::MergeWithNext))
         }
+
+        // -- Navigation --------------------------------------------------
+        //
         // Arrows only leave the region from its top/bottom edge; within a
         // multi-line region they move between rows by default.
         keyboard::Key::Named(Named::ArrowUp) if ctx.at_editor_top && !ctx.at_doc_first => {
-            Some(text_editor::Binding::Custom(Message::MoveUp))
+            Some(Binding::Custom(Message::MoveUp))
         }
         keyboard::Key::Named(Named::ArrowDown) if ctx.at_editor_bottom && !ctx.at_doc_last => {
-            Some(text_editor::Binding::Custom(Message::MoveDown))
+            Some(Binding::Custom(Message::MoveDown))
         }
         // Page navigation moves the active line through the document (a tiny
         // single-line editor has nowhere to page within). `Ctrl` jumps to the
         // very start/end. Handled regardless of `multiline` so you can also page
         // straight out of a table.
-        keyboard::Key::Named(Named::PageUp) => Some(text_editor::Binding::Custom(if command {
+        keyboard::Key::Named(Named::PageUp) => Some(Binding::Custom(if command {
             Message::JumpToStart
         } else {
             Message::PageUp
         })),
-        keyboard::Key::Named(Named::PageDown) => Some(text_editor::Binding::Custom(if command {
+        keyboard::Key::Named(Named::PageDown) => Some(Binding::Custom(if command {
             Message::JumpToEnd
         } else {
             Message::PageDown
         })),
         // Ctrl+Home / Ctrl+End jump to the document start/end. Plain Home/End
         // fall through to the default binding (start/end of the current line).
-        keyboard::Key::Named(Named::Home) if command => {
-            Some(text_editor::Binding::Custom(Message::JumpToStart))
-        }
-        keyboard::Key::Named(Named::End) if command => {
-            Some(text_editor::Binding::Custom(Message::JumpToEnd))
-        }
-        _ => text_editor::Binding::from_key_press(key_press),
+        keyboard::Key::Named(Named::Home) if command => Some(Binding::Custom(Message::JumpToStart)),
+        keyboard::Key::Named(Named::End) if command => Some(Binding::Custom(Message::JumpToEnd)),
+        _ => Binding::from_key_press(key_press),
     }
 }
 
@@ -2891,6 +3492,21 @@ mod tests {
             editor.segments, fresh,
             "seed {seed} step {step}: cached segments diverged from a full walk"
         );
+
+        // `rebuild_blocks` only splices the changed middle, so a region that
+        // moves by more than a line — which every selection message can do —
+        // is exactly where it would leave a stale block behind, rendering the
+        // wrong Markdown for a line that is still on screen.
+        assert_eq!(
+            editor.block_sources,
+            expected_block_sources(editor),
+            "seed {seed} step {step}: parsed blocks diverged from the segments"
+        );
+        assert_eq!(
+            editor.blocks.len(),
+            editor.block_sources.len(),
+            "seed {seed} step {step}: block count diverged from its sources"
+        );
     }
 
     fn next_rand(state: &mut u64) -> u64 {
@@ -2920,7 +3536,7 @@ mod tests {
         let at_doc_first = editor.active_start == 0;
         let at_doc_last = editor.active_end >= editor.lines.len();
 
-        match r % 18 {
+        match r % 23 {
             0 | 1 => {
                 let chars = ['a', ' ', '|', '-', '#', '*', '`', '>', '[', ']'];
                 let ch = chars[(r >> 8) as usize % chars.len()];
@@ -2972,7 +3588,12 @@ mod tests {
             // navigation, so the app sees these custom messages, not raw moves.
             9 => Message::PageUp,
             10 => Message::PageDown,
-            11 => Message::EditorAction(Action::SelectAll),
+            11 => {
+                // Word and line selections keep only the clicked position, so
+                // they exercise the recovery in `selection_span` too.
+                let actions = [Action::SelectAll, Action::SelectWord, Action::SelectLine];
+                Message::EditorAction(actions[(r >> 8) as usize % actions.len()].clone())
+            }
             12 => {
                 let index = (r >> 8) as usize % (editor.lines.len() + 2);
                 Message::Activate(index)
@@ -2993,6 +3614,31 @@ mod tests {
             14 => Message::NewFile,
             15 => Message::JumpToStart,
             16 => Message::JumpToEnd,
+            // Selection widens and shrinks the raw region on its own, so it
+            // gets the same randomized scrutiny as the editing paths: every
+            // one of these can leave `segments` and `blocks` describing a
+            // different set of lines than the region actually covers.
+            17 => Message::SelectAll,
+            18 => {
+                let motions = [
+                    Motion::Up,
+                    Motion::Down,
+                    Motion::Left,
+                    Motion::Right,
+                    Motion::WordLeft,
+                    Motion::WordRight,
+                    Motion::PageUp,
+                    Motion::PageDown,
+                    Motion::DocumentStart,
+                    Motion::DocumentEnd,
+                ];
+                Message::ExtendSelection(motions[(r >> 8) as usize % motions.len()])
+            }
+            19 => Message::DragTo((r >> 8) as usize % (editor.lines.len() + 2)),
+            20 => Message::DragEnd,
+            21 => Message::EditorAction(Action::Edit(Edit::Paste(Arc::new(
+                ["x", "a\nb", "  spaced  ", "<p>html</p>", ""][(r >> 8) as usize % 5].to_owned(),
+            )))),
             _ => Message::EditorAction(Action::Edit(Edit::Insert('x'))),
         }
     }
@@ -3192,6 +3838,932 @@ mod tests {
 
         let _ = editor.update(Message::Undo);
         assert_eq!(editor.lines, before);
+    }
+
+    // -- Selection, clipboard and deletion --------------------------------
+    //
+    // The editor only ever holds *one* `text_editor`, covering the raw region.
+    // A selection is therefore only real — drawable, copyable, replaceable —
+    // for the lines that region spans, which is why nearly every assertion
+    // below checks the region alongside the selected text.
+
+    /// The text `Ctrl+C` would put on the clipboard.
+    fn selected(editor: &MarkdownEditor) -> Option<String> {
+        editor.active_content.selection()
+    }
+
+    /// The raw region as a `start..end` pair.
+    fn region(editor: &MarkdownEditor) -> (usize, usize) {
+        (editor.active_start, editor.active_end)
+    }
+
+    /// An editor holding `document`, with the cursor at `(line, column)`.
+    fn editor_with(document: &str, line: usize, column: usize) -> MarkdownEditor {
+        let (mut editor, _task) = MarkdownEditor::new_with_file(None);
+        editor.load_document(document);
+        editor.activate_line(line, column);
+        editor.rebuild();
+        editor
+    }
+
+    /// A key press as the *focused* active editor sees it, so the default
+    /// bindings (which ignore an unfocused editor) are exercised too.
+    fn key_press(key: keyboard::Key, modifiers: keyboard::Modifiers) -> text_editor::KeyPress {
+        text_editor::KeyPress {
+            key: key.clone(),
+            modified_key: key,
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            modifiers,
+            text: None,
+            status: text_editor::Status::Focused { is_hovered: false },
+        }
+    }
+
+    /// A named key press with no modifiers.
+    fn named_key(named: keyboard::key::Named) -> text_editor::KeyPress {
+        key_press(keyboard::Key::Named(named), keyboard::Modifiers::empty())
+    }
+
+    /// Perform an editor action, the way the widget would report it.
+    fn act(editor: &mut MarkdownEditor, action: text_editor::Action) {
+        let _ = editor.update(Message::EditorAction(action));
+    }
+
+    /// `Shift+→` from the end of a line pulls the next line into the region,
+    /// so the selection can actually cross the line break.
+    #[test]
+    fn shift_right_selects_across_a_line_break() {
+        let mut editor = editor_with("alpha\nbravo", 0, 5);
+
+        let _ = editor.update(Message::ExtendSelection(text_editor::Motion::Right));
+
+        assert_eq!(region(&editor), (0, 2));
+        assert_eq!(selected(&editor).as_deref(), Some("\n"));
+    }
+
+    /// `Shift+←` at column 0 reaches back into the previous line.
+    #[test]
+    fn shift_left_selects_back_across_a_line_break() {
+        let mut editor = editor_with("alpha\nbravo", 1, 0);
+
+        let _ = editor.update(Message::ExtendSelection(text_editor::Motion::Left));
+
+        assert_eq!(region(&editor), (0, 2));
+        assert_eq!(selected(&editor).as_deref(), Some("\n"));
+    }
+
+    /// `Shift+↓` at the bottom of the region grows it downwards.
+    #[test]
+    fn shift_down_selects_into_the_following_line() {
+        let mut editor = editor_with("alpha\nbravo\ncharlie", 0, 0);
+
+        let _ = editor.update(Message::ExtendSelection(text_editor::Motion::Down));
+
+        assert_eq!(region(&editor), (0, 2));
+        assert_eq!(selected(&editor).as_deref(), Some("alpha\n"));
+    }
+
+    /// `Shift+↑` at the top of the region grows it upwards, and the anchor
+    /// stays where the selection started.
+    #[test]
+    fn shift_up_selects_into_the_previous_line() {
+        let mut editor = editor_with("alpha\nbravo\ncharlie", 2, 0);
+
+        let _ = editor.update(Message::ExtendSelection(text_editor::Motion::Up));
+
+        assert_eq!(region(&editor), (1, 3));
+        assert_eq!(selected(&editor).as_deref(), Some("bravo\n"));
+    }
+
+    /// Repeating the motion keeps widening the region one line at a time.
+    #[test]
+    fn selection_grows_one_line_per_keystroke() {
+        let mut editor = editor_with("one\ntwo\nthree\nfour", 0, 0);
+
+        for expected in [(0, 2), (0, 3), (0, 4)] {
+            let _ = editor.update(Message::ExtendSelection(text_editor::Motion::Down));
+            assert_eq!(region(&editor), expected);
+        }
+
+        assert_eq!(selected(&editor).as_deref(), Some("one\ntwo\nthree\n"));
+    }
+
+    /// `Ctrl/Cmd+Shift+End` selects from the cursor to the end of the
+    /// document, however far away that is.
+    #[test]
+    fn selecting_to_the_document_end_covers_everything_below() {
+        let mut editor = editor_with("one\ntwo\nthree", 0, 1);
+
+        let _ = editor.update(Message::ExtendSelection(text_editor::Motion::DocumentEnd));
+
+        assert_eq!(region(&editor), (0, 3));
+        assert_eq!(selected(&editor).as_deref(), Some("ne\ntwo\nthree"));
+    }
+
+    /// `Ctrl/Cmd+Shift+Home` is its mirror image.
+    #[test]
+    fn selecting_to_the_document_start_covers_everything_above() {
+        let mut editor = editor_with("one\ntwo\nthree", 2, 2);
+
+        let _ = editor.update(Message::ExtendSelection(text_editor::Motion::DocumentStart));
+
+        assert_eq!(region(&editor), (0, 3));
+        assert_eq!(selected(&editor).as_deref(), Some("one\ntwo\nth"));
+    }
+
+    /// `Shift+PgDn` takes a whole page of lines with it.
+    #[test]
+    fn selecting_by_page_covers_a_page_of_lines() {
+        let document: String = (0..40).map(|i| format!("line {i}\n")).collect();
+        let mut editor = editor_with(&document, 0, 0);
+        // No real layout in a test, so a page is the fallback line count.
+        editor.viewport = None;
+
+        let _ = editor.update(Message::ExtendSelection(text_editor::Motion::PageDown));
+
+        assert_eq!(region(&editor), (0, PAGE_LINES + 1));
+        assert_eq!(editor.cursor_position(), (PAGE_LINES, 0));
+        assert_eq!(
+            selected(&editor).as_deref(),
+            Some(&document[..document.find("line 15").unwrap()])
+        );
+
+        // And back up again, to exactly where it started.
+        let _ = editor.update(Message::ExtendSelection(text_editor::Motion::PageUp));
+        assert!(!editor.has_selection());
+        assert_eq!(editor.cursor_position(), (0, 0));
+    }
+
+    /// Selection is reversible: shrinking it back to nothing drops it.
+    #[test]
+    fn a_selection_collapsed_back_onto_itself_disappears() {
+        let mut editor = editor_with("alpha\nbravo", 0, 5);
+
+        let _ = editor.update(Message::ExtendSelection(text_editor::Motion::Right));
+        assert!(editor.has_selection());
+
+        act(
+            &mut editor,
+            text_editor::Action::Select(text_editor::Motion::Left),
+        );
+        assert!(!editor.has_selection());
+    }
+
+    /// A double click selects a word and a triple click a line — both through
+    /// the widget, which records only the *clicked* position and leaves the
+    /// extent implicit. The editor must still see them as real selections,
+    /// or `Ctrl+C` after a double click would quietly do nothing.
+    #[test]
+    fn a_word_or_line_selection_is_recognised_and_measured() {
+        let mut editor = editor_with("Hello beautiful world", 0, 10);
+
+        act(&mut editor, text_editor::Action::SelectWord);
+        assert!(editor.has_selection());
+        assert_eq!(selected(&editor).as_deref(), Some("beautiful"));
+        // Recovered from the text: the click position alone says nothing.
+        assert_eq!(editor.selection_span(), ((0, 6), (0, 15)));
+
+        act(&mut editor, text_editor::Action::SelectLine);
+        assert!(editor.has_selection());
+        assert_eq!(editor.selection_span(), ((0, 0), (0, 21)));
+    }
+
+    /// Extending a double-click selection past the line keeps the whole word,
+    /// anchored at its start.
+    #[test]
+    fn extending_a_word_selection_keeps_the_whole_word() {
+        let mut editor = editor_with("Hello beautiful world\nnext line", 0, 10);
+
+        act(&mut editor, text_editor::Action::SelectWord);
+        let _ = editor.update(Message::ExtendSelection(text_editor::Motion::Down));
+
+        assert_eq!(region(&editor), (0, 2));
+        assert!(
+            selected(&editor).is_some_and(|text| text.starts_with("beautiful")),
+            "the double-clicked word should still be selected: {:?}",
+            selected(&editor)
+        );
+    }
+
+    /// The recovery has to pick the occurrence that actually covers the
+    /// cursor, not merely the first one on the line.
+    #[test]
+    fn a_repeated_word_is_located_at_the_cursor() {
+        assert_eq!(selection_start_column("one one one", 8, "one"), 8);
+        assert_eq!(selection_start_column("one one one", 4, "one"), 4);
+        // A caret sitting on the boundary belongs to the word before it.
+        assert_eq!(selection_start_column("one one one", 7, "one"), 4);
+        // Multi-byte text never lands mid-character.
+        assert_eq!(selection_start_column("héllo wörld", 8, "wörld"), 7);
+    }
+
+    // -- Select all -------------------------------------------------------
+
+    #[test]
+    fn select_all_selects_the_whole_document() {
+        let mut editor = editor_with("# Title\n\nbody text\n\n| A |\n|---|\n| 1 |", 2, 0);
+
+        let _ = editor.update(Message::SelectAll);
+
+        assert_eq!(region(&editor), (0, editor.lines.len()));
+        assert_eq!(
+            selected(&editor).as_deref(),
+            Some("# Title\n\nbody text\n\n| A |\n|---|\n| 1 |")
+        );
+    }
+
+    /// `Ctrl+A` is routed to the *document*, not to the raw region the editor
+    /// happens to hold.
+    #[test]
+    fn ctrl_a_selects_the_document() {
+        let binding = editor_binding(ctrl_key_press("a"), BindingContext::default());
+
+        assert!(matches!(
+            binding,
+            Some(text_editor::Binding::Custom(Message::SelectAll))
+        ));
+    }
+
+    /// An empty document has nothing to select, and must not end up with a
+    /// zero-width "selection" that reads back as an empty string.
+    #[test]
+    fn select_all_on_an_empty_document_selects_nothing() {
+        let mut editor = editor_with("", 0, 0);
+
+        let _ = editor.update(Message::SelectAll);
+
+        assert!(!editor.has_selection());
+        assert_eq!(region(&editor), (0, 1));
+    }
+
+    /// Typing replaces the entire selection, which after `Ctrl+A` is the
+    /// entire document — in one undoable step.
+    #[test]
+    fn typing_over_a_select_all_replaces_the_document() {
+        let mut editor = editor_with("one\ntwo\nthree", 0, 0);
+
+        let _ = editor.update(Message::SelectAll);
+        act(
+            &mut editor,
+            text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+        );
+
+        assert_eq!(editor.lines, vec!["x".to_owned()]);
+
+        let _ = editor.update(Message::Undo);
+        assert_eq!(editor.lines, to_lines("one\ntwo\nthree"));
+    }
+
+    // -- Copy and cut -----------------------------------------------------
+
+    /// Copy is the widget's own: it writes exactly [`Content::selection`] to
+    /// the clipboard. What matters here is that the selection really is the
+    /// text the user marked, line breaks and all, and that copying leaves the
+    /// document completely alone.
+    #[test]
+    fn a_copied_selection_is_the_exact_marked_text() {
+        let mut editor = editor_with("  spaced\ttext\nsecond line", 0, 0);
+        let before = editor.lines.clone();
+
+        let _ = editor.update(Message::ExtendSelection(text_editor::Motion::DocumentEnd));
+
+        assert_eq!(
+            selected(&editor).as_deref(),
+            Some("  spaced\ttext\nsecond line")
+        );
+        assert_eq!(editor.lines, before);
+        assert!(!editor.is_dirty);
+    }
+
+    /// With nothing selected, `Ctrl+C` and `Ctrl+X` do nothing at all — in
+    /// particular they must not hand the widget an empty string to write over
+    /// whatever is already on the clipboard.
+    #[test]
+    fn copy_and_cut_without_a_selection_do_nothing() {
+        for key in ["c", "x"] {
+            let binding = editor_binding(ctrl_key_press(key), BindingContext::default());
+
+            assert!(
+                matches!(&binding, Some(text_editor::Binding::Sequence(steps)) if steps.is_empty()),
+                "{key} with no selection should be a no-op"
+            );
+        }
+    }
+
+    /// With a selection they fall through to the widget's own clipboard
+    /// handling.
+    #[test]
+    fn copy_and_cut_with_a_selection_reach_the_clipboard() {
+        let ctx = BindingContext {
+            has_selection: true,
+            ..BindingContext::default()
+        };
+
+        for (key, expected) in [
+            ("c", text_editor::Binding::Copy),
+            ("x", text_editor::Binding::Cut),
+        ] {
+            let press = key_press(
+                keyboard::Key::Character(key.into()),
+                keyboard::Modifiers::CTRL,
+            );
+
+            assert_eq!(
+                std::mem::discriminant(&editor_binding(press, ctx).unwrap()),
+                std::mem::discriminant(&expected),
+                "{key} with a selection should reach the clipboard",
+            );
+        }
+    }
+
+    /// Cut removes exactly the selection, leaves the cursor where it was, and
+    /// is a single undoable edit. (The widget copies first, then sends the
+    /// deletion through as an ordinary edit — which is what is replayed here.)
+    #[test]
+    fn cutting_a_multi_line_selection_is_one_undoable_edit() {
+        let mut editor = editor_with("alpha\nbravo\ncharlie", 0, 2);
+        let before = editor.lines.clone();
+
+        let _ = editor.update(Message::ExtendSelection(text_editor::Motion::Down));
+        assert_eq!(selected(&editor).as_deref(), Some("pha\nbr"));
+
+        act(
+            &mut editor,
+            text_editor::Action::Edit(text_editor::Edit::Delete),
+        );
+
+        assert_eq!(editor.lines, to_lines("alavo\ncharlie"));
+        // The cursor sits where the removed text began, with nothing selected.
+        assert_eq!(editor.cursor_position(), (0, 2));
+        assert!(!editor.has_selection());
+
+        let _ = editor.update(Message::Undo);
+        assert_eq!(editor.lines, before);
+    }
+
+    // -- Paste ------------------------------------------------------------
+
+    /// Pasting text at the cursor keeps every line break, space and tab, and
+    /// leaves the cursor immediately after what was inserted.
+    #[test]
+    fn pasting_multi_line_text_preserves_it_exactly() {
+        let mut editor = editor_with("start\nend", 0, 5);
+
+        act(
+            &mut editor,
+            text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(
+                "\n\tone  two\nthree".to_owned(),
+            ))),
+        );
+
+        assert_eq!(editor.lines, to_lines("start\n\tone  two\nthree\nend"));
+        assert_eq!(editor.cursor_position(), (2, 5));
+        assert!(editor.is_dirty);
+    }
+
+    /// A paste with a selection replaces it, rather than inserting alongside.
+    #[test]
+    fn pasting_over_a_selection_replaces_it() {
+        let mut editor = editor_with("one\ntwo\nthree", 0, 0);
+
+        let _ = editor.update(Message::SelectAll);
+        act(
+            &mut editor,
+            text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new("replaced".to_owned()))),
+        );
+
+        assert_eq!(editor.lines, vec!["replaced".to_owned()]);
+        assert!(!editor.has_selection());
+    }
+
+    /// Rich text arrives as markup; pasting the tags verbatim into a Markdown
+    /// document is never what was meant.
+    #[test]
+    fn pasting_html_converts_it_to_markdown() {
+        let mut editor = editor_with("", 0, 0);
+
+        act(
+            &mut editor,
+            text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(
+                "<h1>Title</h1><p>Some <strong>bold</strong> text.</p>".to_owned(),
+            ))),
+        );
+
+        assert_eq!(editor.lines, to_lines("# Title\n\nSome **bold** text."));
+    }
+
+    /// Plain text that merely *contains* an angle bracket is pasted untouched.
+    #[test]
+    fn pasting_plain_text_never_runs_it_through_the_converter() {
+        let mut editor = editor_with("", 0, 0);
+
+        act(
+            &mut editor,
+            text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(
+                "if a < b && c > d { }".to_owned(),
+            ))),
+        );
+
+        assert_eq!(editor.lines, vec!["if a < b && c > d { }".to_owned()]);
+    }
+
+    // -- Backspace and Delete ---------------------------------------------
+
+    /// Backspace with a selection removes the selection, not one character —
+    /// so it must not be rerouted into a line merge at the region's edge.
+    #[test]
+    fn backspace_with_a_selection_deletes_the_selection() {
+        let ctx = BindingContext {
+            has_selection: true,
+            at_editor_top: true,
+            at_line_start: true,
+            ..BindingContext::default()
+        };
+
+        assert!(matches!(
+            editor_binding(named_key(keyboard::key::Named::Backspace), ctx),
+            Some(text_editor::Binding::Backspace)
+        ));
+
+        let mut editor = editor_with("alpha\nbravo\ncharlie", 1, 0);
+        let _ = editor.update(Message::ExtendSelection(text_editor::Motion::Down));
+        act(
+            &mut editor,
+            text_editor::Action::Edit(text_editor::Edit::Backspace),
+        );
+
+        assert_eq!(editor.lines, to_lines("alpha\ncharlie"));
+    }
+
+    /// Delete behaves identically — the same selection, the same result.
+    #[test]
+    fn delete_with_a_selection_deletes_the_same_selection() {
+        let mut editor = editor_with("alpha\nbravo\ncharlie", 1, 0);
+        let _ = editor.update(Message::ExtendSelection(text_editor::Motion::Down));
+        act(
+            &mut editor,
+            text_editor::Action::Edit(text_editor::Edit::Delete),
+        );
+
+        assert_eq!(editor.lines, to_lines("alpha\ncharlie"));
+    }
+
+    /// Backspace at the start of a line joins it onto the one above.
+    #[test]
+    fn backspace_at_the_start_of_a_line_merges_it_upwards() {
+        let mut editor = editor_with("alpha\nbravo", 1, 0);
+
+        let binding = editor_binding(
+            named_key(keyboard::key::Named::Backspace),
+            BindingContext {
+                at_editor_top: true,
+                at_line_start: true,
+                ..BindingContext::default()
+            },
+        );
+        assert!(matches!(
+            binding,
+            Some(text_editor::Binding::Custom(Message::MergeWithPrevious))
+        ));
+
+        let _ = editor.update(Message::MergeWithPrevious);
+        assert_eq!(editor.lines, vec!["alphabravo".to_owned()]);
+        assert_eq!(editor.cursor_position(), (0, 5));
+    }
+
+    /// Delete at the end of a line pulls the next one up onto it.
+    #[test]
+    fn delete_at_the_end_of_a_line_merges_the_next_one_up() {
+        let mut editor = editor_with("alpha\nbravo", 0, 5);
+
+        let binding = editor_binding(
+            named_key(keyboard::key::Named::Delete),
+            BindingContext {
+                at_editor_bottom: true,
+                at_line_end: true,
+                ..BindingContext::default()
+            },
+        );
+        assert!(matches!(
+            binding,
+            Some(text_editor::Binding::Custom(Message::MergeWithNext))
+        ));
+
+        let _ = editor.update(Message::MergeWithNext);
+        assert_eq!(editor.lines, vec!["alphabravo".to_owned()]);
+    }
+
+    /// There is nothing before the first line or after the last, so neither
+    /// key may run off the document.
+    #[test]
+    fn deleting_past_the_edges_of_the_document_does_nothing() {
+        let mut editor = editor_with("only line", 0, 0);
+
+        let _ = editor.update(Message::MergeWithPrevious);
+        let _ = editor.update(Message::MergeWithNext);
+
+        assert_eq!(editor.lines, vec!["only line".to_owned()]);
+    }
+
+    /// Enter with a selection replaces it with the line break, instead of
+    /// splitting the line around a cursor that is not where the user thinks.
+    #[test]
+    fn enter_with_a_selection_replaces_it() {
+        let ctx = BindingContext {
+            has_selection: true,
+            ..BindingContext::default()
+        };
+
+        assert!(matches!(
+            editor_binding(named_key(keyboard::key::Named::Enter), ctx),
+            Some(text_editor::Binding::Enter)
+        ));
+    }
+
+    // -- Word deletion ----------------------------------------------------
+
+    /// `Ctrl+Backspace` (`Opt+Backspace` on macOS) selects the word to the
+    /// left and deletes it — one word, not one character.
+    #[test]
+    fn ctrl_backspace_removes_the_previous_word() {
+        let press = key_press(
+            keyboard::Key::Named(keyboard::key::Named::Backspace),
+            keyboard::Modifiers::CTRL,
+        );
+        let binding = editor_binding(
+            press,
+            BindingContext {
+                at_line_start: false,
+                ..BindingContext::default()
+            },
+        );
+
+        let Some(text_editor::Binding::Sequence(steps)) = binding else {
+            panic!("word deletion should be a select-then-delete sequence");
+        };
+        assert!(matches!(
+            steps.as_slice(),
+            [
+                text_editor::Binding::Select(text_editor::Motion::WordLeft),
+                text_editor::Binding::Backspace
+            ]
+        ));
+
+        // And the sequence really removes a word.
+        let mut editor = editor_with("Hello beautiful world", 0, 15);
+        act(
+            &mut editor,
+            text_editor::Action::Select(text_editor::Motion::WordLeft),
+        );
+        act(
+            &mut editor,
+            text_editor::Action::Edit(text_editor::Edit::Backspace),
+        );
+
+        assert_eq!(editor.lines, vec!["Hello  world".to_owned()]);
+    }
+
+    /// `Ctrl+Delete` is its forward mirror.
+    #[test]
+    fn ctrl_delete_removes_the_next_word() {
+        let press = key_press(
+            keyboard::Key::Named(keyboard::key::Named::Delete),
+            keyboard::Modifiers::CTRL,
+        );
+        let binding = editor_binding(press, BindingContext::default());
+
+        let Some(text_editor::Binding::Sequence(steps)) = binding else {
+            panic!("word deletion should be a select-then-delete sequence");
+        };
+        assert!(matches!(
+            steps.as_slice(),
+            [
+                text_editor::Binding::Select(text_editor::Motion::WordRight),
+                text_editor::Binding::Delete
+            ]
+        ));
+
+        let mut editor = editor_with("Hello beautiful world", 0, 6);
+        act(
+            &mut editor,
+            text_editor::Action::Select(text_editor::Motion::WordRight),
+        );
+        act(
+            &mut editor,
+            text_editor::Action::Edit(text_editor::Edit::Delete),
+        );
+
+        assert_eq!(editor.lines, vec!["Hello  world".to_owned()]);
+    }
+
+    /// At the very start of a line there is no word to the left: the line
+    /// break is what goes, joining the line onto the one above.
+    #[test]
+    fn ctrl_backspace_at_the_start_of_a_line_merges_it_upwards() {
+        let press = key_press(
+            keyboard::Key::Named(keyboard::key::Named::Backspace),
+            keyboard::Modifiers::CTRL,
+        );
+        let binding = editor_binding(
+            press,
+            BindingContext {
+                at_editor_top: true,
+                at_line_start: true,
+                ..BindingContext::default()
+            },
+        );
+
+        assert!(matches!(
+            binding,
+            Some(text_editor::Binding::Custom(Message::MergeWithPrevious))
+        ));
+    }
+
+    /// With text already selected, word deletion must not throw that
+    /// selection away and delete something else instead.
+    #[test]
+    fn word_deletion_with_a_selection_deletes_the_selection() {
+        let ctx = BindingContext {
+            has_selection: true,
+            ..BindingContext::default()
+        };
+
+        for (named, expected) in [
+            (keyboard::key::Named::Backspace, "backspace"),
+            (keyboard::key::Named::Delete, "delete"),
+        ] {
+            let press = key_press(keyboard::Key::Named(named), keyboard::Modifiers::CTRL);
+            let binding = editor_binding(press, ctx);
+
+            assert!(
+                matches!(
+                    binding,
+                    Some(text_editor::Binding::Backspace | text_editor::Binding::Delete)
+                ),
+                "ctrl+{expected} with a selection should delete just the selection"
+            );
+        }
+    }
+
+    // -- Mouse drag selection ---------------------------------------------
+
+    /// Pressing a rendered line anchors a drag; entering another line while
+    /// the button is held extends the selection over everything between.
+    #[test]
+    fn dragging_down_across_lines_selects_them() {
+        let mut editor = editor_with("one\ntwo\nthree\nfour", 0, 0);
+
+        let _ = editor.update(Message::Activate(1));
+        assert_eq!(editor.drag, Some(Drag { anchor: (1, 0) }));
+
+        let _ = editor.update(Message::DragTo(3));
+
+        assert_eq!(region(&editor), (1, 4));
+        assert_eq!(selected(&editor).as_deref(), Some("two\nthree\nfour"));
+
+        // Releasing keeps the selection; only the anchor is forgotten.
+        let _ = editor.update(Message::DragEnd);
+        assert_eq!(editor.drag, None);
+        assert_eq!(selected(&editor).as_deref(), Some("two\nthree\nfour"));
+    }
+
+    /// Dragging the other way selects backwards from the anchor.
+    #[test]
+    fn dragging_up_across_lines_selects_backwards() {
+        let mut editor = editor_with("one\ntwo\nthree\nfour", 0, 0);
+
+        let _ = editor.update(Message::Activate(3));
+        let _ = editor.update(Message::DragTo(1));
+
+        assert_eq!(region(&editor), (1, 4));
+        assert_eq!(selected(&editor).as_deref(), Some("two\nthree\n"));
+    }
+
+    /// Reversing direction mid-drag follows the pointer rather than
+    /// accumulating everything it has ever touched.
+    #[test]
+    fn a_drag_that_turns_around_follows_the_pointer() {
+        let mut editor = editor_with("one\ntwo\nthree\nfour", 0, 0);
+
+        let _ = editor.update(Message::Activate(0));
+        let _ = editor.update(Message::DragTo(3));
+        let _ = editor.update(Message::DragTo(1));
+
+        assert_eq!(selected(&editor).as_deref(), Some("one\ntwo"));
+    }
+
+    /// Pressing and releasing without moving places the cursor and selects
+    /// nothing — an ordinary click.
+    #[test]
+    fn a_click_without_a_drag_selects_nothing() {
+        let mut editor = editor_with("one\ntwo\nthree", 0, 0);
+
+        let _ = editor.update(Message::Activate(2));
+        let _ = editor.update(Message::DragEnd);
+
+        assert!(!editor.has_selection());
+        assert_eq!(region(&editor), (2, 3));
+        assert_eq!(editor.cursor_position(), (2, 0));
+    }
+
+    /// Clicking inside an existing selection clears it and puts the cursor
+    /// there, the way every text editor behaves.
+    #[test]
+    fn clicking_clears_an_existing_selection() {
+        let mut editor = editor_with("one\ntwo\nthree", 0, 0);
+
+        let _ = editor.update(Message::SelectAll);
+        assert!(editor.has_selection());
+
+        // A press inside the raw region is reported by the widget itself.
+        act(&mut editor, text_editor::Action::Click(iced::Point::ORIGIN));
+
+        assert!(!editor.has_selection());
+        assert!(editor.drag.is_some());
+    }
+
+    /// Dragging over a line that no longer exists (the document shrank under
+    /// a stale message) must not panic or move the cursor out of bounds.
+    #[test]
+    fn dragging_past_the_end_of_the_document_is_ignored() {
+        let mut editor = editor_with("one\ntwo", 0, 0);
+
+        let _ = editor.update(Message::Activate(0));
+        let _ = editor.update(Message::DragTo(99));
+
+        assert_eq!(region(&editor), (0, 1));
+        assert!(!editor.has_selection());
+    }
+
+    /// A drag only listens for the pointer while the button is down.
+    #[test]
+    fn hovering_without_a_drag_changes_nothing() {
+        let mut editor = editor_with("one\ntwo\nthree", 0, 0);
+
+        let _ = editor.update(Message::DragTo(2));
+
+        assert_eq!(region(&editor), (0, 1));
+        assert!(!editor.has_selection());
+    }
+
+    // -- The region tracks the selection ----------------------------------
+
+    /// The region is widened *because* of the selection, so it shrinks back
+    /// the moment the selection is gone. Otherwise one `Shift+↓` too many
+    /// would leave half the document rendering as raw source forever.
+    #[test]
+    fn the_region_shrinks_back_when_the_selection_is_dropped() {
+        let mut editor = editor_with("one\ntwo\nthree", 0, 0);
+
+        let _ = editor.update(Message::SelectAll);
+        assert_eq!(region(&editor), (0, 3));
+
+        // A plain motion collapses the selection onto one of its ends.
+        act(
+            &mut editor,
+            text_editor::Action::Move(text_editor::Motion::Right),
+        );
+
+        assert!(!editor.has_selection());
+        assert_eq!(region(&editor), (2, 3));
+        // The two lines the region gave up are rendered Markdown again.
+        assert_eq!(editor.block_sources, vec!["one\ntwo".to_owned()]);
+    }
+
+    /// A region held open by a *table* is not a selection region and must
+    /// survive a selection being dropped inside it.
+    #[test]
+    fn a_table_region_is_not_collapsed_by_losing_a_selection() {
+        let mut editor = editor_with("| A | B |\n|---|---|\n| 1 | 2 |", 0, 0);
+        assert_eq!(region(&editor), (0, 3));
+
+        let _ = editor.update(Message::SelectAll);
+        act(
+            &mut editor,
+            text_editor::Action::Move(text_editor::Motion::Left),
+        );
+
+        assert_eq!(region(&editor), (0, 3));
+    }
+
+    /// A selection that ends halfway down a table takes the whole table with
+    /// it, so the rows left over never render as an invalid fragment.
+    #[test]
+    fn a_selection_reaching_into_a_table_takes_all_of_it() {
+        let mut editor = editor_with("intro\n\n| A |\n|---|\n| 1 |\n| 2 |", 0, 0);
+
+        let _ = editor.update(Message::ExtendSelection(text_editor::Motion::Down));
+        let _ = editor.update(Message::ExtendSelection(text_editor::Motion::Down));
+
+        // Reaching the header pulls in the delimiter and both body rows.
+        assert_eq!(region(&editor), (0, 6));
+    }
+
+    /// The segment cache and the parsed blocks must stay consistent with a
+    /// region that is being widened and shrunk by the selection.
+    #[test]
+    fn selection_keeps_the_segments_and_blocks_consistent() {
+        let mut editor = editor_with("# Head\n\nalpha\nbravo\n\ntail", 2, 0);
+
+        for message in [
+            Message::ExtendSelection(text_editor::Motion::Down),
+            Message::ExtendSelection(text_editor::Motion::Down),
+            Message::ExtendSelection(text_editor::Motion::Up),
+            Message::SelectAll,
+            Message::EditorAction(text_editor::Action::Move(text_editor::Motion::Left)),
+        ] {
+            let _ = editor.update(message);
+            check_invariants(&editor, 0, 0);
+            assert_eq!(editor.block_sources, expected_block_sources(&editor));
+            let _element = editor.view();
+        }
+    }
+
+    /// A drag that starts inside the editor carries on over the rendered
+    /// lines around it: the widget reports the press, and the pointer leaving
+    /// its bounds is picked up by the line it lands on.
+    #[test]
+    fn a_drag_started_in_the_editor_continues_over_rendered_lines() {
+        let mut editor = editor_with("alpha\nbravo\ncharlie", 0, 0);
+
+        act(&mut editor, text_editor::Action::Click(iced::Point::ORIGIN));
+        assert_eq!(editor.drag, Some(Drag { anchor: (0, 0) }));
+
+        let _ = editor.update(Message::DragTo(2));
+
+        assert_eq!(region(&editor), (0, 3));
+        assert_eq!(selected(&editor).as_deref(), Some("alpha\nbravo\ncharlie"));
+    }
+
+    /// The region must not be shrunk out from under a drag that has, for the
+    /// moment, no selection — the pointer is still down.
+    #[test]
+    fn a_drag_back_to_its_anchor_keeps_the_region_open() {
+        let mut editor = editor_with("one\ntwo\nthree", 0, 0);
+
+        let _ = editor.update(Message::Activate(0));
+        let _ = editor.update(Message::DragTo(2));
+        assert_eq!(region(&editor), (0, 3));
+
+        // Back to the anchor line: the selection shrinks but the drag goes on.
+        let _ = editor.update(Message::DragTo(0));
+        assert!(editor.drag.is_some());
+        assert_eq!(region(&editor), (0, 1));
+    }
+
+    /// Selecting is a move, so it closes the current run of edits: undo must
+    /// not roll the typing before a selection into what replaced it.
+    #[test]
+    fn selecting_ends_the_current_undo_run() {
+        let mut editor = editor_with("word", 0, 4);
+
+        act(
+            &mut editor,
+            text_editor::Action::Edit(text_editor::Edit::Insert('s')),
+        );
+        assert_eq!(editor.lines, vec!["words".to_owned()]);
+
+        let _ = editor.update(Message::SelectAll);
+        act(
+            &mut editor,
+            text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+        );
+        assert_eq!(editor.lines, vec!["x".to_owned()]);
+
+        // First undo takes back only the replacement…
+        let _ = editor.update(Message::Undo);
+        assert_eq!(editor.lines, vec!["words".to_owned()]);
+        // …and the second takes back the typing before it.
+        let _ = editor.update(Message::Undo);
+        assert_eq!(editor.lines, vec!["word".to_owned()]);
+    }
+
+    /// Copying must not touch the undo history either.
+    #[test]
+    fn a_selection_alone_is_not_an_edit() {
+        let mut editor = editor_with("one\ntwo", 0, 0);
+
+        let _ = editor.update(Message::SelectAll);
+        let _ = editor.update(Message::ExtendSelection(text_editor::Motion::Up));
+
+        assert!(!editor.is_dirty);
+        assert!(!editor.history.can_undo());
+    }
+
+    /// A drag installs the mouse listener that reports the release, and
+    /// nothing else does.
+    #[test]
+    fn the_mouse_listener_is_only_installed_while_dragging() {
+        let mut editor = editor_with("one\ntwo", 0, 0);
+        assert!(editor.drag.is_none());
+
+        let _ = editor.update(Message::Activate(1));
+        assert!(editor.drag.is_some());
+
+        let _ = editor.update(Message::DragEnd);
+        assert!(editor.drag.is_none());
     }
 
     // -- Find and replace ------------------------------------------------

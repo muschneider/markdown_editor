@@ -12,6 +12,11 @@ This project was implemented using **vibe coding** — an AI-assisted developmen
   cursor falls back to raw Markdown source, so there is no separate preview pane
 - **Whole-table editing**: entering a table makes the entire table editable at
   once, so rows never fall apart mid-edit
+- **Document-wide selection**: select across lines with the keyboard or by
+  dragging, then copy, cut, paste or delete it like in any text editor —
+  including `Ctrl+A` over the whole file
+- **Markdown-aware paste**: rich text pasted as HTML is converted to Markdown
+  instead of dropping raw tags into the document
 - **Find and replace**: `Ctrl+F` / `Ctrl+H`, with a match counter, case
   toggle, and single or whole-document replacement
 - **Windowed rendering**: only the segments near the viewport are built into the
@@ -29,6 +34,9 @@ to their defaults rather than failing the load.
 
 ## Keyboard Shortcuts
 
+On macOS, read `Ctrl` as `Cmd` — except for word motion and word deletion,
+where the platform modifier is `Option`.
+
 | Keys                      | Action                     |
 | ------------------------- | -------------------------- |
 | `Ctrl+N` / `Ctrl+O` / `Ctrl+S` | New / open / save     |
@@ -43,7 +51,24 @@ to their defaults rather than failing the load.
 | `PgUp` / `PgDn`           | Move a page                |
 | `Ctrl+Home` / `Ctrl+End`  | Start / end of document    |
 
-Clicking a rendered block moves the cursor into it.
+### Selection and clipboard
+
+| Keys                            | Action                                  |
+| ------------------------------- | --------------------------------------- |
+| `Ctrl+A`                        | Select the whole document               |
+| `Ctrl+C` / `Ctrl+X` / `Ctrl+V`  | Copy / cut / paste                      |
+| `Shift+←→↑↓`                    | Extend the selection by a character or line |
+| `Shift+Home` / `Shift+End`      | Extend to the start / end of the line    |
+| `Ctrl+Shift+←` / `Ctrl+Shift+→` | Extend by a word                        |
+| `Ctrl+Shift+Home` / `Ctrl+Shift+End` | Extend to the start / end of the document |
+| `Ctrl+Shift+↑` / `Ctrl+Shift+↓` | Same, matching the macOS convention     |
+| `Shift+PgUp` / `Shift+PgDn`     | Extend by a page                        |
+| `Backspace` / `Delete`          | Delete the selection, or one character  |
+| `Ctrl+Backspace` / `Ctrl+Delete` | Delete the previous / next word        |
+
+Clicking a rendered block moves the cursor into it; dragging from it selects
+across lines, and double- or triple-clicking selects a word or a line. Pasting
+text that is HTML markup converts it to Markdown first.
 
 ## Screenshots
 
@@ -196,6 +221,7 @@ src/
   config.rs        # Persist settings + colors to $XDG_CONFIG_HOME
   file_ops.rs      # Async file I/O operations
   history.rs       # Undo/redo, recorded as line-range replacements
+  html.rs          # HTML -> Markdown conversion for pasted rich text
   icons.rs         # SVG icons for the toolbar
   markdown_view.rs # Theme-aware Markdown rendering + code highlighting
   search.rs        # Find / find-and-replace state and bar
