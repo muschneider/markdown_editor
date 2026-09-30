@@ -22,15 +22,24 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::document::{TextHit, TextHits};
+use crate::fences;
+use crate::syntax;
+use crate::theme::MarkdownColors;
+use iced::advanced::layout::{self, Layout};
+use iced::advanced::renderer;
+use iced::advanced::text::{self as core_text, Paragraph as _};
+use iced::advanced::widget::{Operation, Tree, Widget, tree};
+use iced::advanced::{Clipboard, Shell, overlay};
 use iced::alignment;
 use iced::widget::markdown::{self, Uri, Viewer as MarkdownViewer};
 use iced::widget::table;
 use iced::widget::text::Span;
 use iced::widget::{column, container, rich_text, scrollable, span};
-use iced::{Background, Border, Color, Element, Font, Length, Theme, font, padding};
-use iced_highlighter as highlighter;
-
-use crate::theme::MarkdownColors;
+use iced::{
+    Background, Border, Color, Element, Event, Font, Length, Pixels, Rectangle, Renderer, Size,
+    Theme, Vector, font, mouse, padding, touch,
+};
 
 /// A single highlighted code line: its styled text spans.
 type Line = Arc<[Span<'static, Uri>]>;
@@ -38,58 +47,39 @@ type Line = Arc<[Span<'static, Uri>]>;
 /// The highlighted lines of a whole code block, cheap to clone (`Arc`).
 type Lines = Arc<[Line]>;
 
-/// Memoized syntax highlighting.
+/// Highlighted code blocks, cached whole.
 ///
-/// Owned by the application and cleared when the theme changes (both the
-/// cached colors and the highlighters are theme-specific) or a new document is
-/// loaded.
+/// Owned by the application and cleared when the theme changes (the cached
+/// colors are theme-specific) or a new document is loaded. The grammars, and
+/// the lines they highlighted, live in [`syntax::with_memo`] — shared with the
+/// raw editor, which finds a block's lines already highlighted when the caret
+/// enters it.
 #[derive(Default)]
 pub struct CodeCache {
     /// Already highlighted code blocks, keyed by `language\0code`.
     blocks: HashMap<String, Lines>,
-    /// One reusable highlighter per language token.
-    ///
-    /// Building one is expensive — syntect compiles the theme's scope
-    /// selectors and linearly scans a syntax set with hundreds of entries —
-    /// and it dominated the cost of highlighting: a fresh highlighter per code
-    /// block made opening or scrolling into code-heavy documents stall for
-    /// milliseconds per block. `Stream::reset` returns a used one to its
-    /// initial state, so one per language is enough.
-    streams: HashMap<String, highlighter::Stream>,
 }
 
 impl CodeCache {
-    /// Drop every memoized highlight and highlighter (the theme changed, or a
-    /// new document was loaded).
+    /// Drop every cached block (the theme changed, or a new document was
+    /// loaded).
     pub fn clear(&mut self) {
         self.blocks.clear();
-        self.streams.clear();
     }
 
     /// The highlighted lines of `code`, highlighting it if this is the first
     /// time it is seen.
-    fn highlighted(
-        &mut self,
-        code: &str,
-        language: Option<&str>,
-        theme: highlighter::Theme,
-    ) -> Lines {
-        let language = language.unwrap_or("txt");
+    ///
+    /// `info` is the fence's info string, which names the language first.
+    fn highlighted(&mut self, code: &str, info: Option<&str>, theme: syntax::Theme) -> Lines {
+        let language = info.and_then(fences::language).unwrap_or("txt");
         let key = format!("{language}\u{0}{code}");
 
         if let Some(lines) = self.blocks.get(&key) {
             return lines.clone();
         }
 
-        let stream = self.streams.entry(language.to_owned()).or_insert_with(|| {
-            highlighter::Stream::new(&highlighter::Settings {
-                theme,
-                token: language.to_owned(),
-            })
-        });
-        stream.reset();
-
-        let lines = highlight(stream, code);
+        let lines = syntax::with_memo(language, theme, |memo| highlight(memo, code));
         self.blocks.insert(key, lines.clone());
         lines
     }
@@ -137,23 +127,8 @@ const WARM_UP_LANGUAGES: &[&str] = &[
 ///
 /// `theme` should be the one the editor starts with, so the theme-side caches
 /// are warmed too.
-pub fn warm_up(theme: highlighter::Theme) {
-    // A snippet with a keyword, an identifier, a string, a number and a
-    // comment: enough to reach the contexts a real code block will hit, so
-    // they are compiled here rather than on the UI thread later.
-    const SNIPPET: &str = "let x = \"s\"; /* 1 */";
-
-    std::thread::spawn(move || {
-        for token in WARM_UP_LANGUAGES {
-            let mut stream = highlighter::Stream::new(&highlighter::Settings {
-                theme,
-                token: (*token).to_owned(),
-            });
-            // Parsing a line is what forces the contexts to compile; creating
-            // the stream alone does not.
-            let _ = stream.highlight_line(SNIPPET).count();
-        }
-    });
+pub fn warm_up(theme: syntax::Theme) {
+    syntax::warm_up(theme, WARM_UP_LANGUAGES);
 }
 
 /// Build [`markdown::Settings`] whose inline-code and link colors follow `theme`,
@@ -192,7 +167,7 @@ pub struct Viewer<'a> {
     /// Text color for the header row of Markdown tables.
     table_header_text: Color,
     /// Syntax-highlighting theme for code blocks.
-    code_theme: highlighter::Theme,
+    code_theme: syntax::Theme,
     /// Shared cache of highlighted code blocks.
     cache: &'a RefCell<CodeCache>,
     /// — Table-header detection —
@@ -222,12 +197,26 @@ pub struct Viewer<'a> {
     /// for as long as the viewer does, so copying it per block per frame was
     /// pure waste.
     block_source: Cell<Option<&'a str>>,
+    /// Where rendered text records a press on it.
+    hits: &'a TextHits,
+    /// The number the next piece of text rendered in the current block gets
+    /// — see [`Located`].
+    text_items: Cell<usize>,
+    /// The rendered text of every piece numbered, in order, for tests to
+    /// check the numbering against [`crate::source_map`].
+    #[cfg(test)]
+    numbered: RefCell<Vec<String>>,
 }
 
 impl<'a> Viewer<'a> {
     /// Create a viewer with colors derived from `theme`'s palette, overridden by
-    /// the user's per-tag `colors`.
-    pub fn new(theme: &Theme, colors: &MarkdownColors, cache: &'a RefCell<CodeCache>) -> Self {
+    /// the user's per-tag `colors`, whose text records presses in `hits`.
+    pub fn new(
+        theme: &Theme,
+        colors: &MarkdownColors,
+        cache: &'a RefCell<CodeCache>,
+        hits: &'a TextHits,
+    ) -> Self {
         Self {
             heading_colors: [
                 colors.heading_color(1, theme),
@@ -249,7 +238,39 @@ impl<'a> Viewer<'a> {
             table_column_count: Cell::new(0),
             content_call_index: Cell::new(0),
             block_source: Cell::new(None),
+            hits,
+            text_items: Cell::new(0),
+            #[cfg(test)]
+            numbered: RefCell::default(),
         }
+    }
+
+    /// Make `content`, which draws `spans` at `size`, report presses on it
+    /// as the block's next piece of text.
+    fn located(
+        &self,
+        content: impl Into<Element<'a, Uri>>,
+        spans: Arc<[Span<'static, Uri>]>,
+        size: Pixels,
+        font: Option<Font>,
+    ) -> Element<'a, Uri> {
+        let item = self.text_items.get();
+        self.text_items.set(item + 1);
+
+        #[cfg(test)]
+        self.numbered
+            .borrow_mut()
+            .push(spans.iter().map(|span| span.text.as_ref()).collect());
+
+        Located {
+            content: content.into(),
+            item,
+            spans,
+            size,
+            font,
+            hits: self.hits,
+        }
+        .into()
     }
 
     /// Paint every otherwise-uncolored span with `color` (used for headings, so
@@ -318,6 +339,8 @@ impl<'a> Viewer<'a> {
     /// with column separators and fill width.
     pub fn set_block_source(&self, source: Option<&'a str>) {
         self.block_source.set(source);
+        // The text of every block is numbered from the start.
+        self.text_items.set(0);
     }
 
     /// Build a custom `iced::widget::table` from the block source, with both
@@ -417,7 +440,7 @@ impl<'a> markdown::Viewer<'a, Uri> for Viewer<'a> {
         };
         let color = self.heading_colors[level_index];
 
-        let spans = Self::painted(&text.spans(settings.style), color);
+        let spans: Arc<[_]> = Self::painted(&text.spans(settings.style), color).into();
 
         // Match the default heading's leading spacing between stacked blocks.
         let top = if index > 0 {
@@ -427,9 +450,14 @@ impl<'a> markdown::Viewer<'a, Uri> for Viewer<'a> {
         };
 
         container(
-            rich_text(spans)
-                .on_link_click(Self::on_link_click)
-                .size(size),
+            self.located(
+                rich_text(spans.clone())
+                    .on_link_click(Self::on_link_click)
+                    .size(size),
+                spans,
+                size,
+                None,
+            ),
         )
         .padding(padding::top(top))
         .into()
@@ -460,10 +488,19 @@ impl<'a> markdown::Viewer<'a, Uri> for Viewer<'a> {
             })
             .into()
         } else {
-            rich_text(self.body(&text.spans(settings.style)))
+            let spans: Arc<[_]> = self.body(&text.spans(settings.style)).into();
+            let paragraph = rich_text(spans.clone())
                 .on_link_click(Self::on_link_click)
-                .size(settings.text_size)
-                .into()
+                .size(settings.text_size);
+
+            // Table cells are not numbered: `source_map` does not count the
+            // text inside tables, and every piece after it must keep the
+            // number it has there.
+            if self.in_table.get() {
+                return paragraph.into();
+            }
+
+            self.located(paragraph, spans, settings.text_size, None)
         }
     }
 
@@ -483,12 +520,18 @@ impl<'a> markdown::Viewer<'a, Uri> for Viewer<'a> {
             .borrow_mut()
             .highlighted(code, language, self.code_theme);
 
+        // Each line is a piece of text of its own, in the order the source
+        // map numbers them.
         let rows = lines.iter().cloned().map(|spans| {
-            rich_text(spans)
-                .on_link_click(Self::on_link_click)
-                .font(Font::MONOSPACE)
-                .size(settings.code_size)
-                .into()
+            self.located(
+                rich_text(spans.clone())
+                    .on_link_click(Self::on_link_click)
+                    .font(Font::MONOSPACE)
+                    .size(settings.code_size),
+                spans,
+                settings.code_size,
+                Some(Font::MONOSPACE),
+            )
         });
 
         container(
@@ -548,16 +591,14 @@ impl<'a> markdown::Viewer<'a, Uri> for Viewer<'a> {
     }
 }
 
-/// Syntax-highlight `code` line by line with a freshly reset `stream`,
-/// returning cheap-to-clone styled spans for each line.
-fn highlight(stream: &mut highlighter::Stream, code: &str) -> Lines {
+/// Syntax-highlight `code` line by line with the memoized grammar, from its
+/// initial state, returning cheap-to-clone styled spans for each line.
+fn highlight(memo: &mut syntax::Memo, code: &str) -> Lines {
     let mut lines: Vec<Line> = Vec::new();
+    let mut state = memo.start();
 
     for line in code.lines() {
-        // Collect first so the mutable borrow from `highlight_line` is released
-        // before committing the line's state for the next one.
-        let highlights: Vec<_> = stream.highlight_line(line).collect();
-        stream.commit();
+        let highlights = memo.highlight(line, &mut state);
 
         let mut spans: Vec<Span<'static, Uri>> = Vec::new();
         for (range, highlight) in highlights {
@@ -565,7 +606,7 @@ fn highlight(stream: &mut highlighter::Stream, code: &str) -> Lines {
                 continue;
             }
             spans.push(
-                span(line[range].to_owned())
+                span(line[range.clone()].to_owned())
                     .color_maybe(highlight.color())
                     .font(highlight.font().unwrap_or(Font::MONOSPACE)),
             );
@@ -774,9 +815,293 @@ fn build_cell_element(
     }
 }
 
+// -- Locating presses in rendered text ----------------------------------------
+
+/// Rendered text that knows where a press on it landed.
+///
+/// Wraps the `rich_text` of a heading, a paragraph or a line of code. A press
+/// over it is hit-tested against the same spans, laid out at the same bounds
+/// and size as the `rich_text` laid them out — so it lands on exactly the
+/// character under the pointer — and recorded, as a [`TextHit`], in the slot
+/// the block's `document::Hit` reads once the press has been handled.
+///
+/// `item` numbers the text within its block in drawing order, the order
+/// [`crate::source_map`] numbers it in to map it back to the source.
+struct Located<'a> {
+    content: Element<'a, Uri>,
+    item: usize,
+    spans: Arc<[Span<'static, Uri>]>,
+    size: Pixels,
+    font: Option<Font>,
+    hits: &'a TextHits,
+}
+
+/// The bounds a [`Located`] text was last laid out against.
+struct LaidOut(Size);
+
+impl Widget<Uri, Theme, Renderer> for Located<'_> {
+    fn size(&self) -> Size<Length> {
+        self.content.as_widget().size()
+    }
+
+    fn size_hint(&self) -> Size<Length> {
+        self.content.as_widget().size_hint()
+    }
+
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<LaidOut>()
+    }
+
+    fn state(&self) -> tree::State {
+        tree::State::new(LaidOut(Size::ZERO))
+    }
+
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+
+    fn diff(&self, tree: &mut Tree) {
+        tree.diff_children(std::slice::from_ref(&self.content));
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        // `rich_text` lays its paragraph out against the maximum it is given.
+        tree.state.downcast_mut::<LaidOut>().0 = limits.max();
+
+        self.content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits)
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        self.content
+            .as_widget_mut()
+            .operate(&mut tree.children[0], layout, renderer, operation);
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Uri>,
+        viewport: &Rectangle,
+    ) {
+        self.content.as_widget_mut().update(
+            &mut tree.children[0],
+            event,
+            layout,
+            cursor,
+            renderer,
+            clipboard,
+            shell,
+            viewport,
+        );
+
+        let pressed = matches!(
+            event,
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+                | Event::Touch(touch::Event::FingerPressed { .. })
+        );
+        // A press on a link is the link's.
+        if !pressed || shell.is_event_captured() {
+            return;
+        }
+        let Some(point) = cursor.position_in(layout.bounds()) else {
+            return;
+        };
+
+        let paragraph = <Renderer as core_text::Renderer>::Paragraph::with_spans(core_text::Text {
+            content: &self.spans[..],
+            bounds: tree.state.downcast_ref::<LaidOut>().0,
+            size: self.size,
+            line_height: core_text::LineHeight::default(),
+            font: self
+                .font
+                .unwrap_or_else(|| core_text::Renderer::default_font(renderer)),
+            align_x: core_text::Alignment::Default,
+            align_y: alignment::Vertical::Top,
+            shaping: core_text::Shaping::Advanced,
+            wrapping: core_text::Wrapping::default(),
+        });
+
+        let offset = rendered_offset(&paragraph, &self.spans, point)
+            // Beside the text rather than on it: its end.
+            .unwrap_or_else(|| self.spans.iter().map(|span| span.text.len()).sum());
+
+        self.hits.set(Some(TextHit {
+            item: self.item,
+            offset,
+        }));
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &Renderer,
+    ) -> mouse::Interaction {
+        self.content.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout,
+            cursor,
+            viewport,
+            renderer,
+        )
+    }
+
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        self.content.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            layout,
+            cursor,
+            viewport,
+        );
+    }
+
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut Tree,
+        layout: Layout<'b>,
+        renderer: &Renderer,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<overlay::Element<'b, Uri, Theme, Renderer>> {
+        self.content.as_widget_mut().overlay(
+            &mut tree.children[0],
+            layout,
+            renderer,
+            viewport,
+            translation,
+        )
+    }
+}
+
+impl<'a> From<Located<'a>> for Element<'a, Uri> {
+    fn from(located: Located<'a>) -> Self {
+        Element::new(located)
+    }
+}
+
+/// The byte offset, in the text `spans` render, of the character at `point`
+/// in `paragraph` — which laid those spans out.
+///
+/// The hit test only reports an offset within the paragraph's own line, and a
+/// hard line break (a span of its own, `"\n"`) starts a new one. The span
+/// under the point tells which line that is, so the offset is made relative
+/// to the whole text again.
+fn rendered_offset(
+    paragraph: &impl core_text::Paragraph,
+    spans: &[Span<'static, Uri>],
+    point: iced::Point,
+) -> Option<usize> {
+    let within_line = paragraph.hit_test(point)?.cursor();
+
+    let is_break = |span: &Span<'static, Uri>| span.text.as_ref() == "\n";
+    if !spans.iter().any(is_break) {
+        return Some(within_line);
+    }
+
+    let under = paragraph.hit_span(point)?;
+    let line_start = spans[..under.min(spans.len())]
+        .iter()
+        .rposition(is_break)
+        .map_or(0, |last_break| {
+            spans[..=last_break]
+                .iter()
+                .map(|span| span.text.len())
+                .sum()
+        });
+
+    Some(line_start + within_line)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The viewer numbers the text it renders, and `source_map` numbers the
+    /// text it maps back to the source; a press is only placed right if the
+    /// two agree — on how many pieces there are, and on how long each is.
+    #[test]
+    fn the_viewer_numbers_text_as_the_source_map_does() {
+        let blocks = [
+            "plain paragraph",
+            "# Heading\ntext under it",
+            "a **bold** and *italic* and `code` and [link](https://x.y)",
+            "hard  \nbreak and soft\nbreak",
+            "lead in\n- one\n- two\n  1. nested\n  2. list\n- three",
+            "- [ ] task\n- [x] done",
+            "> quoted\n> - with a list\n>\n> and more",
+            "```rust\nfn a() {}\n\nfn b() {}\n```",
+            "text\n```\ncode\n```\nafter",
+            "| A | B |\n|---|---|\n| 1 | 2 |",
+            "> | A | B |\n> |---|---|\n> | 1 | 2 |\n\nafter the quoted table",
+            "![alt text](image.png) and a caption",
+            "---\ntitle: front matter\n---\nbody",
+            "<div>html block</div>",
+        ];
+
+        let theme = Theme::TokyoNight;
+        let colors = MarkdownColors::default();
+        let cache = RefCell::default();
+        let hits = TextHits::default();
+        let settings = settings(&theme, &colors, 16.0);
+
+        for source in blocks {
+            let viewer = Viewer::new(&theme, &colors, &cache, &hits);
+            let content = markdown::Content::parse(source);
+
+            viewer.set_block_source(Some(source));
+            let _element = markdown::view_with(content.items(), settings, &viewer);
+
+            let numbered = viewer.numbered.take();
+            let expected = crate::source_map::item_lengths(source);
+
+            assert_eq!(
+                numbered.len(),
+                expected.len(),
+                "{source:?}: the viewer numbered {numbered:?}, the source map {expected:?}"
+            );
+            for (text, length) in numbered.iter().zip(&expected) {
+                // An empty line of code is drawn as a space, to keep its height.
+                let drawn_empty = text == " " && *length == 0;
+                assert!(
+                    text.len() == *length || drawn_empty,
+                    "{source:?}: {text:?} is {} bytes, the source map says {length}",
+                    text.len()
+                );
+            }
+        }
+    }
 
     /// The two-column table that previously rendered as a single column must
     /// parse into *both* columns — header and every body row — so the renderer

@@ -19,27 +19,33 @@
 //! but when the cursor enters a table it expands to cover the whole table.
 
 use std::cell::RefCell;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use iced::widget::{
-    Column, button, column, container, markdown, mouse_area, pick_list, row, scrollable, space,
-    text, text_editor,
+    Column, button, column, container, markdown, pick_list, row, scrollable, space, text,
+    text_editor,
 };
 use iced::{Element, Fill, Font, Length, Subscription, Task, Theme, keyboard, mouse, window};
 
 use crate::color_picker;
 use crate::config::{self, Config};
+use crate::document::{self, Key, Press, Reveal, RevealMode};
+use crate::fences;
 use crate::file_ops::{self, FileError};
+use crate::highlighter;
 use crate::history::{self, History};
 use crate::html;
 use crate::icons;
 use crate::markdown_view;
 use crate::search::{self, Search};
 use crate::settings::{self, FontSize, Settings, WrapWidth};
+use crate::source_map;
 use crate::theme as app_theme;
 use crate::theme::{MarkdownColors, MarkdownTag};
 use crate::toolbar::{self, FormatAction};
+use crate::wrap;
 
 /// Default content shown when the editor starts with no file.
 const WELCOME_MD: &str = r#"# Welcome to Markdown Editor
@@ -93,46 +99,57 @@ const DOCUMENT_ID: &str = "md-document";
 /// stay horizontally aligned.
 const LINE_PADDING: u16 = 4;
 
+/// Padding around the whole document, inside the scrollable.
+const DOCUMENT_PADDING: f32 = 12.0;
+
+/// Height of one row of text, relative to its font size: iced's default.
+const LINE_HEIGHT: f32 = 1.3;
+
 /// Lines moved by `PgUp`/`PgDown` before the scrollable has reported a
 /// viewport. Once it has, [`MarkdownEditor::page_lines`] measures a real page
 /// instead.
 const PAGE_LINES: usize = 15;
 
-/// Rough pixel height of one rendered line at [`settings::BASE_FONT_SIZE`], used
-/// to turn the scroll offset into a line range for windowed rendering. Headings
-/// are a bit taller, code lines a bit shorter, and wrapped paragraphs span
-/// several visual lines — but [`estimate_segment_height`] accounts for wrapping
-/// and [`SCROLL_OVERSCAN_LINES`] absorbs the rest, so a placeholder never shows
-/// on screen.
+/// Estimated pixel height of one rendered body line at
+/// [`settings::BASE_FONT_SIZE`] — the starting point for a line's height until
+/// it has been laid out and measured.
 ///
 /// The value is what a body line actually measures: iced lays text out at its
 /// default relative line height (1.3 × 16 px = 20.8 px), and every segment adds
 /// [`LINE_PADDING`] top and bottom plus [`SEGMENT_SPACING`] — 29.8 px in total.
-/// It must stay calibrated: `line_offsets` is compared against, and converted
-/// into, the *real* pixel offsets the scrollable reports, so an estimate that
-/// is off by a fifth drags the render window a screenful away from what is
-/// actually visible and lands every scroll-to-line short of its target.
+/// A good estimate matters less than it used to — measured heights replace it
+/// as soon as a line has been on screen, and the view is anchored to its
+/// content either way — but it still decides where a jump into never-seen
+/// territory (a scrollbar drag) lands, and how long the scrollbar says the
+/// document is.
 const EST_LINE_HEIGHT: f32 = 30.0;
 
 /// Approximate characters per rendered line at [`settings::BASE_FONT_SIZE`],
-/// used to estimate how many visual lines a source line wraps to. Byte length is
-/// used (no UTF-8 decode), which only ever *over*-estimates for multi-byte text
-/// — safe for windowing.
+/// used to estimate how many visual lines a source line wraps to before the
+/// document's real width is known. Byte length is used (no UTF-8 decode),
+/// which only ever *over*-estimates for multi-byte text.
 const EST_CHARS_PER_LINE: u32 = 90;
 
-/// Approximate width (px) of one character at [`settings::BASE_FONT_SIZE`].
+/// Approximate width (px) of one character of rendered (proportional) text at
+/// [`settings::BASE_FONT_SIZE`].
 ///
-/// Only used to convert a configured [`WrapWidth`] into a character count;
-/// [`EST_CHARS_PER_LINE`] already encodes the same ratio against an assumed
-/// window width.
+/// Converts a width — the configured [`WrapWidth`], or the measured width of
+/// the document — into a character count.
 const EST_CHAR_WIDTH: f32 = 8.0;
 
-/// Extra source lines rendered above and below the visible region as real
-/// elements. At 1080 px tall and 30 px/line ≈ 36 visible lines, 130 lines of
-/// overscan is ≈ 3 screens on each side: fast scrolling never reveals a
-/// placeholder before the block is built, and the residual height error of the
-/// few real blocks inside the overscan is far too small to reach the viewport.
-const SCROLL_OVERSCAN_LINES: i64 = 130;
+/// Screens of document built as real widgets above the visible one.
+///
+/// The render window only has to absorb the error of the height estimates
+/// for lines that have not been measured yet: it is recomputed from the new
+/// scroll position before every frame is drawn, and measured heights replace
+/// the estimates as soon as lines have been laid out.
+const OVERSCAN_ABOVE: f32 = 1.0;
+
+/// Screens of document built as real widgets below the visible one. More than
+/// above, because the estimates err towards overstating heights (short code
+/// lines, wrapped text counted by bytes), and a window that ends early leaves
+/// blank space at the bottom of the view.
+const OVERSCAN_BELOW: f32 = 1.5;
 
 /// Maximum height (px) of the color customization panel before it scrolls.
 ///
@@ -147,16 +164,17 @@ const COLOR_PANEL_MAX_HEIGHT: f32 = 320.0;
 /// viewport was unknown), so all of a large file's code blocks were syntax-
 /// highlighted up front — a multi-hundred-millisecond stall. Instead we assume
 /// the document starts scrolled to the top with roughly a screen's worth of
-/// height; combined with [`SCROLL_OVERSCAN_LINES`] this windows the first frame
-/// to the top of the document. The scrollable reports its true bounds on the
-/// next layout, so any guess error self-corrects within one frame and is hidden
-/// by the overscan regardless.
+/// height, which windows the first frame to the top of the document. The
+/// scrollable reports its true bounds on the next layout, so any guess error
+/// self-corrects within one frame.
 const INITIAL_VIEWPORT_HEIGHT: f32 = 1080.0;
 
 /// Main application state.
 pub struct MarkdownEditor {
-    /// The document, split into logical lines (no trailing newline characters).
+    /// The document, split into logical lines (no line ending characters).
     lines: Vec<String>,
+    /// The line ending the document was loaded with, written back on save.
+    line_ending: &'static str,
     /// Parsed Markdown for each rendered block, in document order.
     ///
     /// A block is a contiguous run of non-active, non-blank lines. Kept in sync
@@ -167,6 +185,13 @@ pub struct MarkdownEditor {
     /// in the same order. Lets [`MarkdownEditor::rebuild_blocks`] reuse already
     /// parsed blocks whose text is unchanged instead of re-parsing everything.
     block_sources: Vec<String>,
+    /// Identity of each entry of [`MarkdownEditor::blocks`], in the same order:
+    /// the key its widget is reconciled by. A block keeps its id for as long as
+    /// its parse is reused, so its laid-out text survives navigation, scrolling
+    /// and edits elsewhere in the document.
+    block_ids: Vec<u64>,
+    /// The id the next parsed block gets.
+    next_block_id: u64,
     /// The document split into renderable pieces, kept in sync with
     /// [`MarkdownEditor::lines`] and the active range.
     ///
@@ -174,17 +199,64 @@ pub struct MarkdownEditor {
     /// O(document) and `view` runs on every frame — including the frames a
     /// scroll, a mouse move or a repaint produce, where nothing changed at all.
     segments: Vec<Segment>,
-    /// Estimated distance (px) from the top of the document to the top of each
-    /// line, with a final entry holding the total height. Always
-    /// `lines.len() + 1` long.
+    /// Line ranges (`start..end`, opening fence through closing fence) of the
+    /// document's fenced code blocks, in order. A code block renders — and is
+    /// edited — as one piece, blank lines and all.
+    ///
+    /// Recomputed lazily, by [`MarkdownEditor::refresh_fences`], only after an
+    /// edit that could have moved a fence: ordinary typing never pays for it.
+    fences: Vec<(usize, usize)>,
+    /// Whether [`MarkdownEditor::fences`] must be recomputed: a fence line was
+    /// added, removed or changed. Edits elsewhere only shift the fences.
+    fences_dirty: bool,
+    /// An edit added, removed or changed a code fence, which can change how
+    /// the whole rest of the document splits into blocks: the one kind of
+    /// edit that is allowed to cost a full re-segmentation.
+    structure_changed: bool,
+    /// Lines whose segmentation may have changed since the cached segments
+    /// were last brought up to date, or `None` when they are current.
+    dirty: Option<Dirty>,
+    /// The active range the cached segments were built with: what their
+    /// [`Segment::Active`] stands for.
+    synced_region: (usize, usize),
+    /// Incremented whenever the text of the document changes.
+    revision: u64,
+    /// Height (px) each line contributes to the laid-out document: its share
+    /// of its segment's height as last measured, or an estimate for a line
+    /// that has not been on screen yet. Always `lines.len()` long.
+    line_heights: Vec<f32>,
+    /// Distance (px) from the top of the document to the top of each line —
+    /// the running sum of [`MarkdownEditor::line_heights`] — with a final entry
+    /// holding the total height. Always `lines.len() + 1` long.
     ///
     /// This is the single source of truth for converting between a scroll
-    /// offset and a line index, used both to window the rendered segments and
-    /// to scroll a line into view. Deriving one of those from a flat
-    /// pixels-per-line constant while the other used the wrapping-aware
-    /// estimate made them disagree by hundreds of lines on documents with long
-    /// paragraphs — the viewport then showed nothing but placeholders.
+    /// offset and a line index: it windows the rendered segments, sizes the
+    /// spacers that stand in for the rest, and measures a page. Deriving any
+    /// of those from a flat pixels-per-line constant makes them disagree, and
+    /// the viewport fills with blank spacers.
     line_offsets: Vec<f32>,
+    /// First line whose offset is stale, if any. Offsets are brought up to date
+    /// at the end of every update, from this line down only.
+    offsets_stale_from: Option<usize>,
+    /// Where the document column put its children the last time it was laid
+    /// out. Written during layout; folded into
+    /// [`MarkdownEditor::line_heights`] at the start of the next update.
+    measurements: RefCell<document::Measurements>,
+    /// Where rendered text records the character a press landed on, for the
+    /// segment around it to report — see [`document::TextHit`].
+    text_hits: document::TextHits,
+    /// Generation of the last measurements folded in.
+    measured_generation: u64,
+    /// Width (px) of the document when its lines were last measured. Text
+    /// rewraps at a new width, so a change discards every measurement.
+    measured_width: f32,
+    /// The latest request to bring the caret into view, carried out by the
+    /// document viewport at its next layout.
+    reveal: Option<Reveal>,
+    /// The visual column the caret aims for across vertical moves, in
+    /// characters: kept through short lines, so moving on to a long one
+    /// returns to it.
+    goal_column: Option<usize>,
     /// First line (inclusive) of the contiguous range edited as raw source.
     active_start: usize,
     /// One past the last line of the raw range (exclusive).
@@ -244,13 +316,71 @@ pub struct MarkdownEditor {
     viewport: Option<(f32, f32)>,
 }
 
+/// Messages that end a run of vertical moves, and so forget the column the
+/// caret was aiming for — unless the caret stayed put.
+///
+/// Vertical moves keep it by definition; so do the messages that never touch
+/// the caret (scrolling, preferences, panels).
+fn keeps_goal_column(message: &Message) -> bool {
+    use text_editor::{Action, Motion};
+
+    matches!(
+        message,
+        Message::MoveUp
+            | Message::MoveDown
+            | Message::PageUp
+            | Message::PageDown
+            | Message::EditorAction(Action::Move(Motion::Up | Motion::Down))
+    )
+}
+
+/// How far to scroll to show the caret after `message`, or `None` to leave
+/// the view alone.
+///
+/// Everything that moves the caret or edits at it reveals it; scrolling,
+/// panels and preferences never do, so the user can read elsewhere in the
+/// document without being pulled back. `Minimal` is a no-op while the caret
+/// is on screen, so asking after every key press costs nothing.
+fn reveal_mode(message: &Message) -> Option<RevealMode> {
+    use text_editor::Action;
+
+    match message {
+        // The page keys move the view with the caret, not just after it.
+        Message::PageUp | Message::PageDown => Some(RevealMode::Keep),
+        // Search reveals the match it selects, if it found one — see
+        // `reveal_current_match` — and otherwise leaves the view alone.
+        // The editor's own wheel handling moves nothing but the view.
+        Message::EditorAction(Action::Scroll { .. }) => None,
+        Message::EditorAction(_)
+        | Message::ClickAt(_)
+        | Message::SplitLine
+        | Message::MergeWithPrevious
+        | Message::MergeWithNext
+        | Message::MoveUp
+        | Message::MoveDown
+        | Message::JumpToStart
+        | Message::JumpToEnd
+        | Message::NewFile
+        | Message::FileOpened(Ok(_))
+        | Message::Format(_)
+        | Message::Undo
+        | Message::Redo
+        | Message::ExtendSelection(_)
+        | Message::DragTo(_) => Some(RevealMode::Minimal),
+        // Selecting everything leaves the view where it is, like every
+        // other editor; so does everything that never touches the caret.
+        _ => None,
+    }
+}
+
 /// All messages the application can handle.
 #[derive(Debug, Clone)]
 pub enum Message {
     /// A text editor action on the active region (typing, cursor movement, etc.).
     EditorAction(text_editor::Action),
-    /// Make the line at the given index the active (editable) one.
-    Activate(usize),
+    /// A rendered line was pressed: make it the active (editable) one, with
+    /// the caret where the pointer was.
+    ClickAt(Press),
     /// Split the active line at the cursor (Enter on a standalone line).
     SplitLine,
     /// Merge the active region into the previous line (Backspace at column 0).
@@ -343,7 +473,7 @@ pub enum Message {
     /// Extend the selection by a motion that runs past the raw region's edge,
     /// widening the region so the selection can continue into the document.
     ExtendSelection(text_editor::Motion),
-    /// The mouse was dragged over the rendered line at this index with the
+    /// The mouse was dragged onto the rendered line at this index with the
     /// button held: extend the selection to it.
     DragTo(usize),
     /// The mouse button was released, ending any selection drag.
@@ -367,42 +497,93 @@ enum Segment {
     Block { start: usize, end: usize },
 }
 
-/// Accumulator for a run of consecutive off-screen segments.
-///
-/// Emitting one placeholder widget per skipped segment makes the widget tree —
-/// and with it every diff, layout, event and draw pass — proportional to the
-/// size of the *document* instead of to what is actually on screen. A 10,000
-/// line file then costs thousands of widgets per frame to show forty lines.
-/// Folding each off-screen run into a single spacer of the same total height
-/// keeps the scroll geometry identical while making the tree proportional to
-/// the viewport.
-#[derive(Default)]
-struct Gap {
-    /// Total estimated height of the skipped segments.
-    height: f32,
-    /// Number of segments skipped, needed to also reclaim the spacing the
-    /// parent column would have inserted between them.
-    count: u32,
-}
-
-impl Gap {
-    /// Fold one skipped segment of `height` pixels into the run.
-    fn add(&mut self, height: f32) {
-        self.height += height;
-        self.count += 1;
+impl Segment {
+    /// The document lines the segment covers, given the active range.
+    fn lines(&self, active: (usize, usize)) -> (usize, usize) {
+        match *self {
+            Segment::Active => active,
+            Segment::Blank(index) => (index, index + 1),
+            Segment::Block { start, end } => (start, end),
+        }
     }
 
-    /// Emit the accumulated run as a single spacer, then reset.
-    fn flush<'a>(&mut self, into: &mut Vec<Element<'a, Message>>) {
-        if self.count == 0 {
-            return;
-        }
+    /// Move the segment `delta` lines down the document.
+    fn shift(&mut self, delta: isize) {
+        let shift = |index: &mut usize| *index = index.wrapping_add_signed(delta);
 
-        // Collapsing `count` children into one also removes the `count - 1`
-        // inter-child gaps the column would have added.
-        let height = self.height + (self.count - 1) as f32 * SEGMENT_SPACING;
-        into.push(space::horizontal().height(height).into());
-        *self = Self::default();
+        match self {
+            Segment::Active => {}
+            Segment::Blank(index) => shift(index),
+            Segment::Block { start, end } => {
+                shift(start);
+                shift(end);
+            }
+        }
+    }
+}
+
+/// The part of the document whose segmentation may have changed since the
+/// cached segments were last brought up to date.
+///
+/// Lines before `start` are exactly as they were. So are the lines from `end`
+/// on — only moved: line `n` there was line `n - delta` before. Everything in
+/// between may have changed in any way, which is all a re-segmentation has to
+/// look at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Dirty {
+    /// First line that may have changed, in the current numbering.
+    start: usize,
+    /// One past the last line that may have changed, in the current numbering.
+    end: usize,
+    /// Lines added (or, when negative, removed) since.
+    delta: isize,
+}
+
+impl Dirty {
+    /// Mark `range`, in the current numbering, as possibly changed.
+    fn touch(this: &mut Option<Self>, range: Range<usize>) {
+        *this = Some(match *this {
+            None => Self {
+                start: range.start,
+                end: range.end,
+                delta: 0,
+            },
+            Some(dirty) => Self {
+                start: dirty.start.min(range.start),
+                end: dirty.end.max(range.end),
+                ..dirty
+            },
+        });
+    }
+
+    /// Record that the lines in `range` were replaced by `inserted` lines.
+    fn splice(this: &mut Option<Self>, range: Range<usize>, inserted: usize) {
+        let delta = inserted as isize - range.len() as isize;
+        let replaced_end = range.start + inserted;
+
+        *this = Some(match *this {
+            None => Self {
+                start: range.start,
+                end: replaced_end,
+                delta,
+            },
+            Some(dirty) => Self {
+                start: dirty.start.min(range.start),
+                // An end past the splice moves with the lines after it; one
+                // before or inside it is covered by the replacement.
+                end: if dirty.end >= range.end {
+                    dirty.end.wrapping_add_signed(delta)
+                } else {
+                    replaced_end
+                },
+                delta: dirty.delta + delta,
+            },
+        });
+    }
+
+    /// `end` in the numbering the cached segments use.
+    fn old_end(&self) -> usize {
+        self.end.wrapping_add_signed(-self.delta)
     }
 }
 
@@ -469,10 +650,27 @@ impl MarkdownEditor {
 
         let mut editor = Self {
             lines: split_lines(WELCOME_MD),
+            line_ending: "\n",
             blocks: Vec::new(),
             block_sources: Vec::new(),
+            block_ids: Vec::new(),
+            next_block_id: 0,
             segments: Vec::new(),
+            fences: Vec::new(),
+            fences_dirty: true,
+            structure_changed: false,
+            dirty: None,
+            synced_region: (0, 1),
+            revision: 0,
+            line_heights: Vec::new(),
             line_offsets: Vec::new(),
+            offsets_stale_from: None,
+            measurements: RefCell::default(),
+            text_hits: document::TextHits::default(),
+            measured_generation: 0,
+            measured_width: 0.0,
+            reveal: None,
+            goal_column: None,
             active_start: 0,
             active_end: 1,
             active_content: text_editor::Content::with_text(""),
@@ -490,6 +688,7 @@ impl MarkdownEditor {
             search: None,
             viewport: None,
         };
+        editor.remeasure();
         editor.activate_line(0, 0);
         editor.rebuild();
 
@@ -542,36 +741,64 @@ impl MarkdownEditor {
         format!("{file_name}{dirty} — Markdown Editor")
     }
 
-    /// Handle a message, rebuilding the rendered blocks only when the document
-    /// or the active region may have changed.
+    /// Handle a message, then bring the rendered blocks up to date with what
+    /// it changed — and only that.
     ///
-    /// Re-parsing every block on *every* message — including the pure cursor
-    /// movements and selection changes that fire on each key press — makes the
-    /// editor progressively unresponsive on larger documents. Skipping the
-    /// rebuild for messages that cannot affect the rendered blocks keeps typing
-    /// and navigation cheap.
+    /// Every edit and every move of the active region records which lines it
+    /// touched (see [`Dirty`]); afterwards only the segments around those
+    /// lines are walked again, and only blocks whose text is new are parsed.
+    /// A message that changes neither the text nor the region — a scroll
+    /// report, a preference, typing inside the region — costs nothing here.
+    /// Navigation, which used to walk and compare the whole document on every
+    /// key press, costs the same on a ten-line file as on a ten-thousand-line
+    /// one.
     pub fn update(&mut self, message: Message) -> Task<Message> {
-        let needs_rebuild = message_affects_blocks(&message);
-        // Search matches are byte ranges into `lines`, so they go stale on any
-        // document change — including plain typing, which deliberately skips
-        // the block rebuild. The search messages maintain their own matches and
-        // report `false` above, so this neither double-works nor misses an
-        // edit. It is a no-op, and costs nothing, while the bar is closed.
-        let touches_document =
-            needs_rebuild || matches!(&message, Message::EditorAction(action) if action.is_edit());
+        // What the last layout measured is only valid for the document as it
+        // was then, so it is taken in before anything changes.
+        self.absorb_measurements();
+
+        let keeps_goal = keeps_goal_column(&message);
+        let reveal = reveal_mode(&message);
+        let caret = self.cursor_position();
+        let revision = self.revision;
 
         let task = self.handle(message);
 
+        // An edit that moved a code fence may have paired fences around the
+        // region, which must then cover the whole new code block.
+        if self.structure_changed {
+            self.snap_region_to_fences();
+        }
+
         // A region widened to hold a selection shrinks back as soon as the
         // selection is gone, so no more of the document stays raw than has to.
-        let collapsed = self.collapse_selection_region();
+        self.collapse_selection_region();
 
-        if needs_rebuild || collapsed {
+        if std::mem::take(&mut self.structure_changed) {
+            // A fence changed: everything after it may split differently.
             self.rebuild();
+        } else {
+            // Re-walks just what changed; free when nothing did.
+            self.sync();
         }
-        if touches_document {
+
+        let edited = self.revision != revision;
+
+        // Search matches are byte ranges into `lines`, so they go stale on any
+        // document change. It is a no-op, and costs nothing, while the bar is
+        // closed.
+        if edited {
             self.refresh_search();
         }
+
+        if !keeps_goal && (edited || self.cursor_position() != caret) {
+            self.goal_column = None;
+        }
+        if let Some(mode) = reveal {
+            self.request_reveal(mode);
+        }
+
+        self.refresh_offsets();
         task
     }
 
@@ -598,6 +825,15 @@ impl MarkdownEditor {
                 // A press inside the editor also anchors a selection drag, so
                 // it can carry on over the rendered lines around it.
                 let is_click = matches!(action, text_editor::Action::Click(_));
+                // A run of vertical moves that starts inside a multi-line
+                // region aims for the column it started from, including once
+                // it leaves the region.
+                if matches!(
+                    action,
+                    text_editor::Action::Move(text_editor::Motion::Up | text_editor::Motion::Down)
+                ) {
+                    let _ = self.goal_column();
+                }
                 self.active_content.perform(action);
 
                 if is_click {
@@ -615,15 +851,17 @@ impl MarkdownEditor {
 
                 Task::none()
             }
-            Message::Activate(index) => {
-                if index >= self.lines.len() {
+            Message::ClickAt(press) => {
+                if press.line >= self.lines.len() {
                     return self.focus_active();
                 }
 
+                let (line, column) = self.press_target(press);
+
                 // A click always targets a line outside the current raw region
                 // (rendered blocks/blanks only); guard against redundant resets.
-                if index < self.active_start || index >= self.active_end {
-                    self.activate_line(index, 0);
+                if line < self.active_start || line >= self.active_end {
+                    self.activate_line(line, column);
                 }
                 // Pressing is also how a drag-selection starts. Releasing
                 // without moving leaves the cursor placed and nothing selected,
@@ -650,9 +888,8 @@ impl MarkdownEditor {
 
                 let start = self.active_start;
                 self.record_change(start, 1, 2, (start, column));
-                self.lines[start] = left;
+                self.splice_lines(start..start + 1, [left, right]);
                 let new_index = start + 1;
-                self.lines.insert(new_index, right);
                 self.is_dirty = true;
 
                 self.activate_line(new_index, 0);
@@ -669,8 +906,10 @@ impl MarkdownEditor {
                 let join_column = self.lines[previous_index].len();
                 // The previous line and the region's first line become one.
                 self.record_change(previous_index, 2, 1, (previous_index, join_column));
-                let current = self.lines.remove(self.active_start);
-                self.lines[previous_index].push_str(&current);
+                let joined = [&self.lines[previous_index], &self.lines[self.active_start]]
+                    .map(String::as_str)
+                    .concat();
+                self.splice_lines(previous_index..previous_index + 2, [joined]);
                 self.is_dirty = true;
 
                 self.activate_line(previous_index, join_column);
@@ -687,71 +926,86 @@ impl MarkdownEditor {
                 let join_column = self.lines[last_line].len();
                 // The region's last line and the following one become one.
                 self.record_change(last_line, 2, 1, (last_line, join_column));
-                let next = self.lines.remove(self.active_end);
-                self.lines[last_line].push_str(&next);
+                let joined = [&self.lines[last_line], &self.lines[self.active_end]]
+                    .map(String::as_str)
+                    .concat();
+                self.splice_lines(last_line..last_line + 2, [joined]);
                 self.is_dirty = true;
 
                 self.activate_line(last_line, join_column);
                 Task::none()
             }
             // The navigation messages below move the active line while the
-            // editor is already focused; its stable tree position keeps that
-            // focus, so they must NOT issue a re-focus task (doing so forced a
-            // full layout pass on every key press and pegged the CPU).
+            // editor is already focused; its stable key keeps that focus, so
+            // they must NOT issue a re-focus task (doing so forced a full
+            // layout pass on every key press and pegged the CPU). Nor do they
+            // scroll: `update` asks the viewport to reveal the caret, which it
+            // does against the real layout, in the same frame.
             Message::MoveUp => {
-                if self.active_start == 0 {
+                let goal = self.goal_column();
+                // A wrapped line, or a region of several, is walked row by
+                // row before it is left.
+                if self.step_within_editor(text_editor::Motion::Up) || self.active_start == 0 {
                     return Task::none();
                 }
-                let column = self.active_content.cursor().position.column;
-                self.activate_line(self.active_start - 1, column);
+                let target = self.active_start - 1;
+                let column = self.landing_column(target, goal, false);
+                self.activate_line(target, column);
                 Task::none()
             }
             Message::MoveDown => {
-                if self.active_end >= self.lines.len() {
+                let goal = self.goal_column();
+                if self.step_within_editor(text_editor::Motion::Down)
+                    || self.active_end >= self.lines.len()
+                {
                     return Task::none();
                 }
-                let column = self.active_content.cursor().position.column;
-                self.activate_line(self.active_end, column);
+                let target = self.active_end;
+                let column = self.landing_column(target, goal, true);
+                self.activate_line(target, column);
                 Task::none()
             }
-            // Unlike the single-line moves above, the page and jump keys can
-            // land far outside the visible region, so they must take the
-            // viewport with them: moving the active line alone leaves the
-            // cursor off screen with the document apparently untouched.
+            // The page keys move the view along with the caret: `update` asks
+            // for a reveal that keeps the caret at the same height on screen.
+            // At the ends of the document they go to the very start or end of
+            // it, as in every other editor, which still brings it into view.
             Message::PageUp => {
                 if self.active_start == 0 {
-                    // Already on the first line, but the view may still sit
-                    // below it.
-                    return scroll_to_document_start();
+                    self.activate_line(0, 0);
+                    return Task::none();
                 }
-                let column = self.active_content.cursor().position.column;
-                let from = self.active_start;
-                let target = from.saturating_sub(self.page_lines());
+                let goal = self.goal_column();
+                let target = self
+                    .active_start
+                    .saturating_sub(self.page_lines(self.active_start, false));
+                let column = self.landing_column(target, goal, true);
                 self.activate_line(target, column);
-                self.scroll_by_lines(from, target)
+                Task::none()
             }
             Message::PageDown => {
                 let last = self.lines.len() - 1;
                 if self.active_end > last {
-                    return scroll_to_document_end();
+                    self.activate_line(last, self.lines[last].len());
+                    return Task::none();
                 }
-                let column = self.active_content.cursor().position.column;
-                let from = self.active_start;
-                let target = (from + self.page_lines()).min(last);
+                let goal = self.goal_column();
+                let target =
+                    (self.active_start + self.page_lines(self.active_start, true)).min(last);
+                let column = self.landing_column(target, goal, true);
                 self.activate_line(target, column);
-                self.scroll_by_lines(from, target)
+                Task::none()
             }
             Message::JumpToStart => {
                 // Ctrl+Home / Ctrl+PgUp: the very start of the document.
                 self.activate_line(0, 0);
-                scroll_to_document_start()
+                Task::none()
             }
             Message::JumpToEnd => {
                 // Ctrl+End / Ctrl+PgDown: the very end of the document.
                 let last = self.lines.len() - 1;
                 let end_column = self.lines[last].len();
                 self.activate_line(last, end_column);
-                scroll_to_document_end()
+                Task::none()
             }
             Message::LinkClicked(url) => {
                 // Open the link off the UI thread. `webbrowser::open` spawns a
@@ -1168,8 +1422,8 @@ impl MarkdownEditor {
         let font_size = self.settings.font_size.pixels();
         let settings = markdown_view::settings(&theme, &self.colors, font_size);
         let highlight_theme = app_theme::code_highlighter(&theme);
-        let viewer = markdown_view::Viewer::new(&theme, &self.colors, &self.code_cache);
-        let metrics = self.metrics();
+        let viewer =
+            markdown_view::Viewer::new(&theme, &self.colors, &self.code_cache, &self.text_hits);
 
         // Cursor context for the active region's key bindings (computed once).
         let cursor = self.active_content.cursor();
@@ -1189,74 +1443,89 @@ impl MarkdownEditor {
             at_doc_last: self.active_end >= self.lines.len(),
         };
 
-        // Split the rendered segments around the active editor. The editor is
-        // always placed at the *same* position in the widget tree (between the
-        // "before" and "after" blocks), so iced preserves its widget state —
-        // crucially keyboard focus and the highlighter cache — as the active
-        // line moves. In a flat list the editor's child index changes whenever
-        // you navigate, so iced discards its state and we'd have to re-focus on
-        // every key press (an extra full layout pass that pegged the CPU).
+        // Every segment is a child of one keyed column, so each keeps its
+        // widget state — the editor its keyboard focus and highlighter cache,
+        // a rendered block its shaped text — for as long as it exists, however
+        // the children around it come and go.
         //
         // Windowed rendering: for large documents only the segments near the
-        // current scroll viewport are built into the widget tree; everything
-        // else is replaced by a single spacer per off-screen *run*, so the
-        // scrollable's content height (and thus the scroll position) stays
-        // stable while the widget tree stays proportional to what is actually
-        // on screen rather than to the size of the document. Until the
-        // scrollable reports a viewport (first frame, small documents whose
-        // window already covers every line, or tests with no real layout) the
-        // window is `None` and the whole document renders.
-        let window = visible_line_window(self.viewport, &self.line_offsets, self.lines.len());
+        // current scroll viewport are built into the widget tree; each run of
+        // the rest is replaced by a single spacer as tall as the lines it
+        // stands for, so the widget tree stays proportional to what is on
+        // screen rather than to the size of the document. Until the scrollable
+        // reports a viewport (first frame, small documents whose window already
+        // covers every line, or tests with no real layout) the window is `None`
+        // and the whole document renders.
+        let window = self.render_window();
 
-        // The rendered lines only listen for the pointer *entering* them while
-        // a drag is actually under way. Wiring it unconditionally would post a
-        // message on every mouse move across the document — a full `update`
-        // per hovered line, for nothing.
+        // The rendered lines only follow the pointer while a drag is actually
+        // under way. Following it unconditionally would post a message on
+        // every mouse move across the document — a full `update` per hovered
+        // line, for nothing.
         let dragging = self.drag.is_some();
 
-        let mut block_index = 0;
-        let mut before: Vec<Element<'_, Message>> = Vec::new();
-        let mut after: Vec<Element<'_, Message>> = Vec::new();
-        let mut seen_active = false;
-        let mut editor_element: Option<Element<'_, Message>> = None;
-        // Height and segment count of the off-screen run being accumulated.
-        let mut gap = Gap::default();
+        let mut body = document::Column::new(&self.measurements)
+            .spacing(SEGMENT_SPACING)
+            .padding(DOCUMENT_PADDING)
+            // A configured text width caps the measure and centres the text;
+            // the scrollable still fills the window.
+            .max_width(self.settings.wrap_width.pixels())
+            .monospace(font_size);
 
-        for segment in &self.segments {
-            // `is_none_or` short-circuits without running the closure when there
-            // is no viewport, so the per-segment line-range match costs nothing
-            // on the full-render path (small documents, first frame, tests).
-            let in_window = window.is_none_or(|(ws, we)| {
-                let (line_start, line_end) = match segment {
-                    Segment::Active => (self.active_start, self.active_end),
-                    Segment::Blank(index) => (*index, *index + 1),
-                    Segment::Block { start, end } => (*start, *end),
-                };
-                (line_end as i64) > ws && (line_start as i64) < we
-            });
+        // Only the segments in the window are visited — found by binary
+        // search, so building the view costs the same wherever in however
+        // long a document it is — plus the editor, which always renders for
+        // real: it holds the keyboard focus and the caret.
+        let active = (self.active_start, self.active_end);
+        let bounds = |segment: &Segment| segment.lines(active);
+        let (first, last) = match window {
+            Some((top, bottom)) => (
+                self.segments.partition_point(|s| bounds(s).1 <= top),
+                self.segments.partition_point(|s| bounds(s).0 < bottom),
+            ),
+            None => (0, self.segments.len()),
+        };
+        let editor = self
+            .segments
+            .partition_point(|s| bounds(s).1 <= self.active_start);
+        let visited = if editor < first {
+            [editor..editor + 1, first..last]
+        } else if editor >= last {
+            [first..last, editor..editor + 1]
+        } else {
+            [first..last, 0..0]
+        };
 
-            // Off-screen segments never build a widget: their height is folded
-            // into the current run and emitted as one spacer when the run ends.
-            if !in_window && !matches!(segment, Segment::Active) {
-                match segment {
-                    Segment::Blank(_) => gap.add(metrics.line_height),
-                    Segment::Block { start, end } => {
-                        gap.add(estimate_segment_height(&self.lines, *start, *end, metrics));
-                        block_index += 1;
-                    }
-                    Segment::Active => unreachable!("filtered above"),
-                }
-                continue;
+        // `blocks` holds one entry per Block segment, rendered or not.
+        let mut block_index = self.segments[..first]
+            .iter()
+            .filter(|s| matches!(s, Segment::Block { .. }))
+            .count();
+        // The first line no child stands for yet; lines skipped over become
+        // spacers.
+        let mut covered = 0;
+        let mut gaps = 0;
+
+        for segment in visited
+            .into_iter()
+            .flatten()
+            .map(|index| &self.segments[index])
+        {
+            let (start, end) = bounds(segment);
+
+            if start > covered {
+                body = body.push(
+                    Key::Gap(gaps),
+                    (covered, start),
+                    self.spacer((covered, start)),
+                );
+                gaps += 1;
             }
-
-            let target = if seen_active { &mut after } else { &mut before };
-            gap.flush(target);
+            covered = end;
 
             match segment {
-                // The cursor line (or table) shown as a focused raw
-                // `text_editor`. It always renders for real (never windowed):
-                // it holds the focused editor and its highlighter cache, and is
-                // where the cursor is.
+                // The cursor line (or table, or code block) shown as a focused
+                // raw `text_editor`.
                 Segment::Active => {
                     let editor = text_editor(&self.active_content)
                         .id(ACTIVE_LINE_ID)
@@ -1265,41 +1534,36 @@ impl MarkdownEditor {
                         .padding(LINE_PADDING)
                         .font(Font::MONOSPACE)
                         .size(font_size)
-                        // Equivalent to the convenience `.highlight("md", …)`,
-                        // spelled out so it works without iced's `highlighter`
-                        // feature (which we drop to stop the Markdown parser
-                        // from eagerly highlighting every code block).
-                        .highlight_with::<iced_highlighter::Highlighter>(
-                            iced_highlighter::Settings {
+                        // Markdown, with fenced code highlighted by its own
+                        // language directly (see `highlighter`).
+                        .highlight_with::<highlighter::Highlighter>(
+                            highlighter::Settings {
                                 theme: highlight_theme,
-                                token: "md".to_owned(),
                             },
-                            |highlight, _theme| highlight.to_format(),
+                            |highlight, theme| highlight.to_format(theme),
                         )
                         .key_binding(move |key_press| editor_binding(key_press, ctx))
                         // No box around the cursor's line: it is drawn flush
                         // with the rendered rows, marked only by the caret.
                         .style(app_theme::active_line);
 
-                    editor_element = Some(container(editor).width(Fill).into());
-                    seen_active = true;
+                    body = body.push(Key::Editor, active, container(editor).width(Fill));
                 }
                 Segment::Blank(index) => {
                     // A space keeps the empty line clickable and gives the
                     // document natural paragraph spacing.
-                    target.push(selectable(
-                        container(text(" ").font(Font::MONOSPACE).size(font_size))
-                            .width(Fill)
-                            .padding(LINE_PADDING)
-                            .into(),
-                        *index,
-                        dragging,
-                    ));
+                    let blank = container(text(" ").font(Font::MONOSPACE).size(font_size))
+                        .width(Fill)
+                        .padding(LINE_PADDING);
+
+                    body = body.push(
+                        Key::Blank(*index),
+                        (start, end),
+                        self.hit(blank, start, end, dragging),
+                    );
                 }
-                Segment::Block { start, end } => {
-                    // `block_index` tracks every Block segment (rendered or not)
-                    // so it stays aligned with `self.blocks`.
-                    let body: Element<'_, Message> = match self.blocks.get(block_index) {
+                Segment::Block { .. } => {
+                    let rendered: Element<'_, Message> = match self.blocks.get(block_index) {
                         Some(content) => {
                             viewer.set_block_source(
                                 self.block_sources.get(block_index).map(String::as_str),
@@ -1309,61 +1573,46 @@ impl MarkdownEditor {
                         }
                         // Defensive fallback; `blocks` is kept aligned with the
                         // segment walk, so this should not happen.
-                        None => text(self.lines[*start..*end].join("\n")).into(),
+                        None => text(self.lines[start..end].join("\n")).into(),
                     };
-                    block_index += 1;
+                    let key = self
+                        .block_ids
+                        .get(block_index)
+                        .map_or(Key::Blank(start), |&id| Key::Block(id));
 
-                    target.push(selectable(
-                        container(body).width(Fill).padding(LINE_PADDING).into(),
-                        *start,
-                        dragging,
-                    ));
+                    body = body.push(
+                        key,
+                        (start, end),
+                        self.hit(
+                            container(rendered).width(Fill).padding(LINE_PADDING),
+                            start,
+                            end,
+                            dragging,
+                        ),
+                    );
+                    block_index += 1;
                 }
             }
         }
 
-        gap.flush(if seen_active { &mut after } else { &mut before });
+        if covered < self.lines.len() {
+            let rest = (covered, self.lines.len());
+            body = body.push(Key::Gap(gaps), rest, self.spacer(rest));
+        }
 
-        // `segments` always yields exactly one `Active` segment, but fall back
-        // to an empty slot rather than panicking if that ever changes.
-        let editor_element = editor_element.unwrap_or_else(|| space::vertical().height(0).into());
+        let scrollable = scrollable(body).id(DOCUMENT_ID).width(Fill).height(Fill);
 
-        let body = column![
-            Column::with_children(before)
-                .spacing(SEGMENT_SPACING)
-                .width(Fill),
-            editor_element,
-            Column::with_children(after)
-                .spacing(SEGMENT_SPACING)
-                .width(Fill),
-        ]
-        .spacing(SEGMENT_SPACING)
-        .padding(12)
-        .width(Fill);
-
-        // A configured text width caps the measure and centres the column; the
-        // scrollable still fills the window, so only the content is narrowed.
-        let body: Element<'_, Message> = match self.settings.wrap_width.pixels() {
-            Some(max_width) => container(body).max_width(max_width).center_x(Fill).into(),
-            None => body.into(),
-        };
-
+        // Pinned to its content, and carrying out the latest request to show
+        // the caret against the real layout. It reports the viewport — so
+        // view() can move the render window — only when the view nears the
+        // edge of what is rendered: every other scroll step is a plain redraw,
+        // with no update, view or layout at all.
         let document = container(
-            scrollable(body)
-                .id(DOCUMENT_ID)
-                .width(Fill)
-                .height(Fill)
-                // Track the viewport so view() can window the rendered blocks.
-                // The callback fires on first layout and whenever the offset
-                // changes (scrolling), but is skipped for redundant viewports, so
-                // typing without scrolling produces no extra messages.
-                .on_scroll(|viewport: scrollable::Viewport| {
-                    let offset = viewport.absolute_offset();
-                    let bounds = viewport.bounds();
-                    Message::Scrolled {
-                        offset_y: offset.y,
-                        view_height: bounds.height,
-                    }
+            document::Viewport::new(scrollable, &self.measurements)
+                .reveal(self.reveal)
+                .on_scroll(|offset_y, view_height| Message::Scrolled {
+                    offset_y,
+                    view_height,
                 }),
         )
         .width(Fill)
@@ -1411,28 +1660,30 @@ impl MarkdownEditor {
 
         // Chrome is stacked above the document in the order it can be opened:
         // toolbar, settings, colors (opened from settings), search.
-        let mut main_column = Column::new().spacing(0);
-
-        for chrome in [
-            toolbar,
-            self.show_settings_panel
-                .then(|| settings::view(&self.settings)),
-            color_panel,
-            self.search.as_ref().map(search::view),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            main_column = main_column.push(chrome);
+        //
+        // Every piece has a slot of its own, filled with nothing while it is
+        // closed. A column matches its children to their widget state by
+        // position: were a closed panel simply left out, opening it would
+        // move the document down a slot and hand the document's state —
+        // scroll position, focused editor and all — to the panel.
+        //
+        // The filler must be `Shrink`, not a fixed zero height: a column
+        // drops children of fixed zero size altogether.
+        fn slot(chrome: Option<Element<'_, Message>>) -> Element<'_, Message> {
+            chrome.unwrap_or_else(|| space::Space::new().into())
         }
 
-        main_column = main_column.push(document);
-
-        if let Some(status_bar) = status_bar {
-            main_column = main_column.push(status_bar);
-        }
-
-        main_column.into()
+        Column::new()
+            .push(slot(toolbar))
+            .push(slot(
+                self.show_settings_panel
+                    .then(|| settings::view(&self.settings)),
+            ))
+            .push(slot(color_panel))
+            .push(slot(self.search.as_ref().map(search::view)))
+            .push(document)
+            .push(slot(status_bar))
+            .into()
     }
 
     /// Return the application theme selected by the user.
@@ -1440,9 +1691,11 @@ impl MarkdownEditor {
         self.settings.theme.clone()
     }
 
-    /// Layout estimates for the current font size and text width.
+    /// Layout estimates for the current font size and text width — and the
+    /// document's real width, once it has been laid out.
     fn metrics(&self) -> Metrics {
         Metrics::new(self.settings.font_size, self.settings.wrap_width)
+            .measured((self.measured_width > 0.0).then_some(self.measured_width))
     }
 
     /// Whether some open chrome needs the global key listener installed.
@@ -1470,7 +1723,14 @@ impl MarkdownEditor {
 
     /// Replace the whole document with `text`, resetting the active region.
     fn load_document(&mut self, text: &str) {
+        self.line_ending = line_ending_of(text);
         self.lines = split_lines(text);
+        self.revision += 1;
+        self.fences_dirty = true;
+        // Nothing of the old document survives: re-segment all of it.
+        self.structure_changed = true;
+        // Nothing of the new document has been measured yet.
+        self.remeasure();
         self.activate_line(0, 0);
         self.history.clear();
         // Highlighted blocks from the old document are no longer referenced.
@@ -1485,15 +1745,170 @@ impl MarkdownEditor {
         self.viewport = Some((0.0, INITIAL_VIEWPORT_HEIGHT));
     }
 
-    /// Reconstruct the full document text from its lines.
+    /// Reconstruct the full document text from its lines, with the line
+    /// ending the file was loaded with.
     fn document_text(&self) -> String {
-        self.lines.join("\n")
+        self.lines.join(self.line_ending)
     }
 
-    /// Re-segment the document and rebuild the rendered blocks.
+    /// Re-segment the whole document and rebuild the rendered blocks, reusing
+    /// the parse of every block whose text is unchanged.
+    ///
+    /// O(document): only for when the document was replaced or a code fence
+    /// changed. Everything else goes through [`MarkdownEditor::sync`].
     fn rebuild(&mut self) {
         self.resegment();
         self.rebuild_blocks();
+        self.dirty = None;
+        self.structure_changed = false;
+        self.synced_region = (self.active_start, self.active_end);
+        self.refresh_offsets();
+    }
+
+    /// Bring the cached segments and blocks up to date with the lines marked
+    /// dirty, re-walking only the segments around them.
+    ///
+    /// A segment boundary is decided by the two lines on either side of it —
+    /// whether each is blank, and whether either is an edge of the active
+    /// region — and by the code fences. So every boundary with both of its
+    /// lines outside the dirty range is exactly where it was (fences are only
+    /// shifted here: a changed fence goes through [`MarkdownEditor::rebuild`]
+    /// instead). The walk restarts at the last such boundary before the
+    /// range, stops at the first one after it, and the segments in between
+    /// are replaced; the ones after only move by the lines gained or lost.
+    fn sync(&mut self) {
+        let region = (self.active_start, self.active_end);
+        if self.dirty.is_none() && region == self.synced_region {
+            return;
+        }
+        if self.fences_dirty || self.segments.is_empty() {
+            return self.rebuild();
+        }
+
+        let old_region = self.synced_region;
+        let bounds = |segment: &Segment| segment.lines(old_region);
+
+        // Both the region the segments were built for and the current one
+        // render differently from the lines around them, so both are walked
+        // again. The old one is in the old numbering: lines before the dirty
+        // range kept their index, lines after it moved by `delta`.
+        let mut dirty = self.dirty.take().unwrap_or(Dirty {
+            start: region.0,
+            end: region.1,
+            delta: 0,
+        });
+        let old_end = dirty.old_end();
+        // A position inside the dirty range has no single new number; the
+        // range's own edge is always a safe (wider) choice.
+        let renumbered_start = if old_region.0 < dirty.start {
+            old_region.0
+        } else if old_region.0 >= old_end {
+            old_region.0.wrapping_add_signed(dirty.delta)
+        } else {
+            dirty.start
+        };
+        let renumbered_end = if old_region.1 <= dirty.start {
+            old_region.1
+        } else if old_region.1 >= old_end {
+            old_region.1.wrapping_add_signed(dirty.delta)
+        } else {
+            dirty.end
+        };
+
+        dirty.start = dirty.start.min(renumbered_start).min(region.0);
+        dirty.end = dirty
+            .end
+            .max(renumbered_end)
+            .max(region.1)
+            .min(self.lines.len());
+        let old_end = dirty.old_end();
+
+        // Segments ending before the range are untouched; so are the ones
+        // starting after it. Everything in between is walked again.
+        let first = self.segments.partition_point(|s| bounds(s).1 < dirty.start);
+        let last = self.segments.partition_point(|s| bounds(s).0 <= old_end);
+
+        let from = self
+            .segments
+            .get(first)
+            .map_or(dirty.start, |s| bounds(s).0.min(dirty.start));
+        let to = self.segments.get(last).map_or(self.lines.len(), |s| {
+            bounds(s).0.wrapping_add_signed(dirty.delta)
+        });
+
+        let mut fresh = Vec::new();
+        walk_segments(&self.lines, &self.fences, region, from..to, &mut fresh);
+
+        // The blocks of the replaced segments, in the dense block vectors.
+        let block_start = self.segments[..first]
+            .iter()
+            .filter(|s| matches!(s, Segment::Block { .. }))
+            .count();
+        let replaced_blocks = self.segments[first..last]
+            .iter()
+            .filter(|s| matches!(s, Segment::Block { .. }))
+            .count();
+
+        self.replace_blocks(block_start..block_start + replaced_blocks, &fresh);
+
+        let after = first + fresh.len();
+        self.segments.splice(first..last, fresh);
+        if dirty.delta != 0 {
+            for segment in &mut self.segments[after..] {
+                segment.shift(dirty.delta);
+            }
+        }
+
+        self.synced_region = region;
+    }
+
+    /// Replace the blocks at `range` of the block vectors with the blocks of
+    /// `segments`, keeping the parse (and the widget key) of any old one whose
+    /// text reappears.
+    fn replace_blocks(&mut self, range: Range<usize>, segments: &[Segment]) {
+        let mut reusable: Vec<Option<(String, markdown::Content, u64)>> = self
+            .block_sources
+            .drain(range.clone())
+            .zip(self.blocks.drain(range.clone()))
+            .zip(self.block_ids.drain(range.clone()))
+            .map(|((source, content), id)| Some((source, content, id)))
+            .collect();
+
+        let mut sources = Vec::new();
+        let mut blocks = Vec::new();
+        let mut ids = Vec::new();
+
+        for segment in segments {
+            let Segment::Block { start, end } = *segment else {
+                continue;
+            };
+
+            let old = reusable.iter_mut().find(|old| {
+                old.as_ref().is_some_and(|(source, _, _)| {
+                    block_source_eq(&self.lines, (start, end), source)
+                })
+            });
+
+            let (source, content, id) = match old.and_then(Option::take) {
+                Some(reused) => reused,
+                None => {
+                    let source = self.lines[start..end].join("\n");
+                    let content = markdown::Content::parse(&source);
+                    let id = self.next_block_id;
+                    self.next_block_id += 1;
+                    (source, content, id)
+                }
+            };
+
+            sources.push(source);
+            blocks.push(content);
+            ids.push(id);
+        }
+
+        let at = range.start;
+        self.block_sources.splice(at..at, sources);
+        self.blocks.splice(at..at, blocks);
+        self.block_ids.splice(at..at, ids);
     }
 
     /// Recompute the cached [`Segment`] list from the lines and active range.
@@ -1501,165 +1916,422 @@ impl MarkdownEditor {
     /// The old buffer's allocation is reused, so a re-segmentation of an
     /// unchanged-size document allocates nothing.
     fn resegment(&mut self) {
+        self.refresh_fences();
+
         let mut segments = std::mem::take(&mut self.segments);
         collect_segments(
             &self.lines,
+            &self.fences,
             self.active_start,
             self.active_end,
             &mut segments,
         );
         self.segments = segments;
-        self.remeasure();
     }
 
-    /// Rebuild [`MarkdownEditor::line_offsets`] from the current lines.
+    /// Recompute [`MarkdownEditor::fences`] if an edit may have moved one.
+    fn refresh_fences(&mut self) {
+        if std::mem::take(&mut self.fences_dirty) {
+            self.fences = fences::blocks(&self.lines);
+        }
+    }
+
+    /// Estimate every line's height afresh, discarding what was measured.
     ///
     /// Must be re-run whenever the font size or text width changes: both scale
-    /// every line's height, and this table is the sole offset↔line mapping.
+    /// every line's height, and [`MarkdownEditor::line_offsets`] is the sole
+    /// offset↔line mapping. Measurements taken at the old size would be wrong,
+    /// so they go too; the lines on screen are measured again on the next
+    /// layout.
     fn remeasure(&mut self) {
+        self.refresh_fences();
         let metrics = self.metrics();
 
+        self.line_heights.clear();
+        self.line_heights
+            .extend(self.lines.iter().enumerate().map(|(index, line)| {
+                estimate_line_height(line, fences::in_code(&self.fences, index), metrics)
+            }));
+
         self.line_offsets.clear();
-        self.line_offsets.reserve(self.lines.len() + 1);
-
-        let mut top = 0.0;
-        for line in &self.lines {
-            self.line_offsets.push(top);
-            top += estimate_line_height(line, metrics);
-        }
-        self.line_offsets.push(top);
+        self.offsets_stale_from = Some(0);
+        self.refresh_offsets();
     }
 
-    /// Scroll the document so `line` is comfortably inside the viewport.
+    /// Replace `lines[range]` with `replacement`, keeping the per-line height
+    /// table in step: new lines start out estimated.
     ///
-    /// The line is placed a third of the way down rather than at the very top,
-    /// so there is context above it.
-    fn scroll_to_line(&self, line: usize) -> Task<Message> {
-        let top = self.line_offsets.get(line).copied().unwrap_or_default();
-        let view_height = self
-            .viewport
-            .map_or(INITIAL_VIEWPORT_HEIGHT, |(_, height)| height);
+    /// Every edit that changes the number of lines goes through here, so
+    /// measured heights survive edits elsewhere in the document.
+    fn splice_lines(&mut self, range: Range<usize>, replacement: impl IntoIterator<Item = String>) {
+        let start = range.start;
+        let before = self.lines.len();
+        let removed_fence = self.lines[range.clone()]
+            .iter()
+            .any(|line| fences::is_fence(line));
 
-        iced::widget::operation::scroll_to(
-            DOCUMENT_ID,
-            scrollable::AbsoluteOffset {
-                x: 0.0,
-                y: (top - view_height / 3.0).max(0.0),
-            },
-        )
-    }
+        self.lines.splice(range.clone(), replacement);
+        let inserted = self.lines.len() + range.len() - before;
+        let delta = inserted as isize - range.len() as isize;
+        let added_fence = self.lines[start..start + inserted]
+            .iter()
+            .any(|line| fences::is_fence(line));
 
-    /// Scroll `line` into view, but only as far as it takes.
-    ///
-    /// Unlike [`MarkdownEditor::scroll_to_line`], which re-centres the
-    /// document a third of the way down, this moves the viewport by the
-    /// smallest amount that puts `line` on screen — and not at all when it
-    /// already is. Extending a selection one line at a time must not make the
-    /// document jump under the cursor.
-    fn reveal_line(&self, line: usize) -> Task<Message> {
-        let Some((offset_y, view_height)) = self.viewport else {
-            return Task::none();
-        };
-
-        let top = self.line_top(line);
-        let bottom = self
-            .line_offsets
-            .get(line + 1)
-            .copied()
-            .unwrap_or(top + self.metrics().line_height);
-
-        let target = if top < offset_y {
-            top
-        } else if bottom > offset_y + view_height {
-            bottom - view_height
+        // Fences pair up by their order alone, so unless a fence line itself
+        // came or went, every code block is the same block, moved.
+        if removed_fence || added_fence {
+            self.fences_dirty = true;
+            self.structure_changed = true;
         } else {
-            return Task::none();
-        };
+            fences::shift(&mut self.fences, range.clone(), delta);
+        }
 
-        iced::widget::operation::scroll_to(
-            DOCUMENT_ID,
-            scrollable::AbsoluteOffset {
-                x: 0.0,
-                y: target.max(0.0),
-            },
-        )
+        let metrics = self.metrics();
+        let heights: Vec<f32> = self.lines[start..start + inserted]
+            .iter()
+            .map(|line| estimate_line_height(line, false, metrics))
+            .collect();
+        self.line_heights.splice(range.clone(), heights);
+
+        Dirty::splice(&mut self.dirty, range, inserted);
+        self.revision += 1;
+        self.mark_offsets_stale(start);
     }
 
-    /// Document lines that fill one screen — how far `PgUp`/`PgDown` move the
-    /// active line.
+    /// Record that the text of `range` changed in place, without adding or
+    /// removing lines.
+    fn touch_lines(&mut self, range: Range<usize>, fences_before: &[(usize, u8, usize, bool)]) {
+        if fences::signature(&self.lines[range.clone()]) != fences_before {
+            self.fences_dirty = true;
+            self.structure_changed = true;
+        }
+
+        Dirty::touch(&mut self.dirty, range);
+        self.revision += 1;
+    }
+
+    /// Note that the offsets of `line` and everything after it are stale.
+    fn mark_offsets_stale(&mut self, line: usize) {
+        self.offsets_stale_from = Some(self.offsets_stale_from.map_or(line, |from| from.min(line)));
+    }
+
+    /// Bring [`MarkdownEditor::line_offsets`] up to date with the heights,
+    /// from the first stale line down.
+    fn refresh_offsets(&mut self) {
+        let Some(from) = self.offsets_stale_from.take() else {
+            return;
+        };
+
+        let from = from.min(self.line_heights.len());
+        self.line_offsets.truncate(from + 1);
+        if self.line_offsets.len() < from + 1 {
+            // The table was cleared (or never built): start from the top.
+            self.line_offsets.clear();
+            self.line_offsets.push(0.0);
+        }
+
+        let first = self.line_offsets.len() - 1;
+        let mut top = self.line_offsets[first];
+        for height in &self.line_heights[first..] {
+            top += height;
+            self.line_offsets.push(top);
+        }
+    }
+
+    /// Fold what the document column measured at its last layout into the
+    /// per-line heights, so spacers and the render window follow the real
+    /// layout rather than estimates.
+    ///
+    /// Each laid-out segment's height (plus the spacing after it) is shared
+    /// among its lines in proportion to their estimates.
+    fn absorb_measurements(&mut self) {
+        let (generation, width) = {
+            let measurements = self.measurements.borrow();
+            (measurements.generation, measurements.width)
+        };
+        if generation == self.measured_generation {
+            return;
+        }
+        self.measured_generation = generation;
+
+        // Text rewraps at a new width: every height measured at the old one is
+        // stale. Start again from estimates made for the new width.
+        if (width - self.measured_width).abs() > 0.5 {
+            self.measured_width = width;
+            self.remeasure();
+        }
+
+        self.refresh_fences();
+        let metrics = self.metrics();
+        let measurements = self.measurements.borrow();
+        let mut stale: Option<usize> = None;
+
+        for placed in &measurements.children {
+            let (start, end) = placed.lines;
+            if matches!(placed.key, Key::Gap(_)) || start >= end || end > self.lines.len() {
+                continue;
+            }
+
+            let estimates: Vec<f32> = (start..end)
+                .map(|line| {
+                    let in_code = fences::in_code(&self.fences, line);
+                    estimate_line_height(&self.lines[line], in_code, metrics)
+                })
+                .collect();
+            let total: f32 = estimates.iter().sum();
+            let measured = placed.height + SEGMENT_SPACING;
+
+            for (height, estimate) in self.line_heights[start..end].iter_mut().zip(estimates) {
+                let share = measured * estimate / total;
+                if (*height - share).abs() > 0.01 {
+                    *height = share;
+                    stale = Some(stale.map_or(start, |first| first.min(start)));
+                }
+            }
+        }
+
+        drop(measurements);
+        if let Some(line) = stale {
+            self.mark_offsets_stale(line);
+        }
+    }
+
+    /// Lines to build as real widgets, or `None` for all of them.
+    fn render_window(&self) -> Option<(usize, usize)> {
+        render_window(self.viewport, &self.line_offsets, self.lines.len())
+    }
+
+    /// A spacer standing in for the off-screen document `lines`.
+    fn spacer(&self, (start, end): (usize, usize)) -> Element<'_, Message> {
+        let top = self.line_top(start);
+        let bottom = self.line_top(end);
+        // The run is one child where it would have been several: it keeps the
+        // spacing after itself, and loses the ones between its segments.
+        let height = (bottom - top - SEGMENT_SPACING).max(0.0);
+
+        space::horizontal().height(height).into()
+    }
+
+    /// Make a rendered segment covering `start..end` respond to the pointer
+    /// line by line.
+    fn hit<'a>(
+        &'a self,
+        content: impl Into<Element<'a, Message>>,
+        start: usize,
+        end: usize,
+        dragging: bool,
+    ) -> Element<'a, Message> {
+        let weights = self.line_heights.get(start..end).unwrap_or_default();
+
+        document::Hit::new(content, start, weights, &self.text_hits, Message::ClickAt)
+            .on_drag_maybe(dragging.then_some(Message::DragTo))
+            .into()
+    }
+
+    /// Ask the viewport to show the caret, the next time it is laid out.
+    fn request_reveal(&mut self, mode: RevealMode) {
+        let generation = self.reveal.map_or(1, |reveal| reveal.generation + 1);
+
+        self.reveal = Some(Reveal {
+            generation,
+            span: self.caret_span(),
+            mode,
+        });
+    }
+
+    /// The caret's row of the editor, with a row of context above and below,
+    /// as distances from the editor's top edge.
+    fn caret_span(&self) -> (f32, f32) {
+        let (top, bottom) = self.caret_row_span();
+        let row = bottom - top;
+
+        (top - row, bottom + row)
+    }
+
+    /// The caret's row of the editor, as distances from its top edge.
+    fn caret_row_span(&self) -> (f32, f32) {
+        let row = self.settings.font_size.pixels() * LINE_HEIGHT;
+        let top = f32::from(LINE_PADDING) + self.caret_row() as f32 * row;
+
+        (top, top + row)
+    }
+
+    /// Visual rows of the editor above the caret's.
+    fn caret_row(&self) -> usize {
+        let capacity = self.wrap_capacity();
+        let (line, column) = self.cursor_position();
+        let line = line.min(self.lines.len() - 1);
+
+        let above: usize = self.lines[self.active_start.min(line)..line]
+            .iter()
+            .map(|text| wrap::rows(text, capacity).len())
+            .sum();
+
+        above + wrap::row_of(&wrap::rows(&self.lines[line], capacity), column)
+    }
+
+    /// Characters per row of the raw editor, as last laid out. Unbounded until
+    /// the document has been laid out once: nothing wraps before then.
+    fn wrap_capacity(&self) -> usize {
+        let text_width = self.measured_width - 2.0 * f32::from(LINE_PADDING);
+        if text_width <= 0.0 {
+            return usize::MAX;
+        }
+
+        ((text_width / self.monospace_advance()).floor() as usize).max(1)
+    }
+
+    /// Width of one character of the raw editor's monospace text: measured
+    /// once the editor has been laid out at the current size, the typical
+    /// 0.6 em until then.
+    fn monospace_advance(&self) -> f32 {
+        let size = self.settings.font_size.pixels();
+
+        match self.measurements.borrow().monospace {
+            Some((measured, advance)) if measured == size && advance > 0.0 => advance,
+            _ => size * 0.6,
+        }
+    }
+
+    /// The visual column the caret aims for across vertical moves, taken from
+    /// its current position when a run of them starts.
+    fn goal_column(&mut self) -> usize {
+        if let Some(goal) = self.goal_column {
+            return goal;
+        }
+
+        let (line, column) = self.cursor_position();
+        let text = &self.lines[line.min(self.lines.len() - 1)];
+        let goal = wrap::column_in_row(text, &wrap::rows(text, self.wrap_capacity()), column);
+
+        self.goal_column = Some(goal);
+        goal
+    }
+
+    /// Where the caret lands on `line` when a vertical move carries it there:
+    /// `goal` characters into the line's first row when moving down, or into
+    /// its last row when moving up — so a wrapped line is entered at the row
+    /// nearest to where the caret came from.
+    fn landing_column(&self, line: usize, goal: usize, downward: bool) -> usize {
+        let text = &self.lines[line];
+        let rows = wrap::rows(text, self.wrap_capacity());
+        let row = if downward { 0 } else { rows.len() - 1 };
+
+        wrap::offset_in_row(text, &rows, row, goal)
+    }
+
+    /// Move the caret one visual row inside the editor, reporting whether it
+    /// moved: it cannot when already on the editor's first or last row.
+    ///
+    /// Done by the editor itself, which knows exactly where its lines wrap.
+    fn step_within_editor(&mut self, motion: text_editor::Motion) -> bool {
+        // A selection is dropped where its moving end is, and the caret moves
+        // on from there — rather than the first key press only collapsing it.
+        // Without one the caret is left exactly as it is: placing it again
+        // could move it to the other side of a wrap point.
+        if self.active_content.cursor().selection.is_some() {
+            let head = self.active_content.cursor().position;
+            self.place_caret(head);
+        }
+
+        let before = self.active_content.cursor().position;
+        self.active_content
+            .perform(text_editor::Action::Move(motion));
+
+        self.active_content.cursor().position != before
+    }
+
+    /// The `(line, byte column)` of the source a press on a rendered segment
+    /// landed on.
+    ///
+    /// A press on rendered text knows the exact character it hit, which the
+    /// source map traces back through the Markdown that produced it. A press
+    /// beside the text — in a margin, on a bullet or a rule — falls back to
+    /// an estimate from the pointer's position.
+    fn press_target(&mut self, press: Press) -> (usize, usize) {
+        let (start, end) = press.segment;
+
+        if let Some(hit) = press.text
+            && end <= self.lines.len()
+            && let Some((line, column)) =
+                source_map::locate(&self.lines[start..end], hit.item, hit.offset)
+        {
+            return (start + line, column);
+        }
+
+        (press.line, self.click_column(press))
+    }
+
+    /// The byte column a press beside a rendered line's text corresponds to,
+    /// estimated.
+    ///
+    /// Without the text under the pointer to go by, the press is placed by
+    /// proportion: the row it fell on, then the characters from the row's
+    /// start to the pointer at the size the line is rendered in.
+    fn click_column(&mut self, press: Press) -> usize {
+        self.refresh_fences();
+
+        let text = &self.lines[press.line];
+        let font_size = self.settings.font_size.pixels();
+        let x = (press.x - f32::from(LINE_PADDING)).max(0.0);
+
+        if fences::in_code(&self.fences, press.line) {
+            // Code renders monospace at the code size, inside the block's
+            // padding, and scrolls sideways rather than wrapping.
+            let code = font_size * CODE_SCALE;
+            let chars = (x - code * 1.25) / (self.monospace_advance() * CODE_SCALE);
+            return char_offset(text, chars.round().max(0.0) as usize);
+        }
+
+        let (prefix, scale) = rendered_prefix(text);
+        let width = EST_CHAR_WIDTH * font_size / f32::from(settings::BASE_FONT_SIZE) * scale;
+        let text_width = self.measured_width - 2.0 * f32::from(LINE_PADDING);
+        let per_row = (text_width / width).floor().max(1.0);
+        let rows = ((text.len() - prefix) as f32 / per_row).ceil().max(1.0);
+        let row = (press.fraction * rows).floor().min(rows - 1.0);
+        let chars = row * per_row + (x / width).round();
+
+        prefix + char_offset(&text[prefix..], chars as usize)
+    }
+
+    /// Document lines one screen spans from `from`, towards the end of the
+    /// document when `forward` and towards its start otherwise — how far
+    /// `PgUp`/`PgDown` move the active line.
     ///
     /// Measured through `line_offsets` rather than counted as a fixed number of
     /// lines, so a page is a real page: wrapped paragraphs and larger fonts
-    /// make it shorter, exactly as they make fewer lines fit on screen. It is
-    /// also the geometry [`MarkdownEditor::scroll_by_lines`] scrolls with, so
-    /// the cursor and the viewport travel the same distance and the cursor
-    /// keeps its place on screen.
+    /// make it shorter, exactly as they make fewer lines fit on screen. The
+    /// viewport then scrolls by exactly as far as the caret moved, so the
+    /// caret keeps its place on screen.
     ///
-    /// Spanned across the *visible* region rather than downwards from the
-    /// active line: near the end of the document there are not a screenful of
-    /// lines left below the cursor, and measuring from it would shrink `PgUp`
-    /// to a single line exactly where a full page is wanted.
+    /// Measured from the caret in the direction it is about to travel — over
+    /// the lines the page key scrolls into view. Near the end of the document
+    /// there is not a screenful left *below* the caret; measured that way,
+    /// `PgUp` would shrink to a line exactly where a full page is wanted.
     ///
     /// At least one line, so a page key always moves.
-    fn page_lines(&self) -> usize {
-        let Some((offset_y, view_height)) = self.viewport else {
+    fn page_lines(&self, from: usize, forward: bool) -> usize {
+        let Some((_, view_height)) = self.viewport else {
             return PAGE_LINES;
         };
 
-        let first = line_at_offset(&self.line_offsets, offset_y);
-        let last = line_at_offset(&self.line_offsets, offset_y + view_height);
-        last.saturating_sub(first).max(1)
+        let top = self.line_top(from);
+        let to = if forward {
+            line_at_offset(&self.line_offsets, top + view_height)
+        } else {
+            line_at_offset(&self.line_offsets, (top - view_height).max(0.0))
+        };
+
+        to.abs_diff(from).max(1)
     }
 
-    /// Estimated top of `line` in content pixels.
+    /// Top of `line` in content pixels, as measured or estimated.
     fn line_top(&self, line: usize) -> f32 {
-        self.line_offsets.get(line).copied().unwrap_or_default()
-    }
-
-    /// Scroll the document by the height of the lines between `from` and `to`,
-    /// so the cursor keeps its place on screen while it moves.
-    ///
-    /// Deliberately *relative*: only the distance travelled comes from the
-    /// estimated `line_offsets`, never the absolute destination, and iced clamps
-    /// the result to the real content. An absolute offset would have to assume
-    /// the estimate matches the rendered layout everywhere above the target,
-    /// where this only assumes it over the lines actually crossed.
-    fn scroll_by_lines(&self, from: usize, to: usize) -> Task<Message> {
-        iced::widget::operation::scroll_by(
-            DOCUMENT_ID,
-            scrollable::AbsoluteOffset {
-                x: 0.0,
-                y: self.line_top(to) - self.line_top(from),
-            },
-        )
-    }
-
-    /// Shift every cached segment after the active one by `delta` lines.
-    ///
-    /// An edit inside the active region can only add or remove lines *within*
-    /// it: the segments before it are untouched and the ones after it keep
-    /// their shape and merely slide. Sliding them is a handful of integer adds,
-    /// where a full [`MarkdownEditor::resegment`] would rescan every line of
-    /// the document on every keystroke.
-    fn shift_segments_after_active(&mut self, delta: isize) {
-        if delta == 0 {
-            return;
-        }
-
-        let shift = |index: &mut usize| *index = index.wrapping_add_signed(delta);
-
-        let mut past_active = false;
-        for segment in &mut self.segments {
-            match segment {
-                Segment::Active => past_active = true,
-                Segment::Blank(index) if past_active => shift(index),
-                Segment::Block { start, end } if past_active => {
-                    shift(start);
-                    shift(end);
-                }
-                _ => {}
-            }
-        }
+        self.line_offsets
+            .get(line)
+            .or(self.line_offsets.last())
+            .copied()
+            .unwrap_or_default()
     }
 
     /// Rebuild the rendered blocks from the cached segments, reusing any
@@ -1731,7 +2403,14 @@ impl MarkdownEditor {
             })
             .unzip();
 
+        // Every newly parsed block is a new widget, under a new key; the ones
+        // reused above keep theirs, and with it their laid-out text.
+        let first_id = self.next_block_id;
+        self.next_block_id += blocks.len() as u64;
+
         let replaced = prefix..old_len - suffix;
+        self.block_ids
+            .splice(replaced.clone(), first_id..self.next_block_id);
         self.block_sources.splice(replaced.clone(), sources);
         self.blocks.splice(replaced, blocks);
 
@@ -1740,16 +2419,16 @@ impl MarkdownEditor {
 
     /// Make `line` part of the active (raw) region and place the cursor on it.
     ///
-    /// The region expands to a whole table when `line` is inside one (see
-    /// [`active_bounds`]); otherwise it covers just that line. The cursor is
-    /// placed at `column` (a byte offset, clamped to a char boundary) on `line`.
+    /// The region expands to a whole table or fenced code block when `line` is
+    /// inside one (see [`MarkdownEditor::region_bounds`]); otherwise it covers
+    /// just that line. The cursor is placed at `column` (a byte offset, clamped
+    /// to a char boundary) on `line`.
     ///
     /// When the range and text are unchanged (e.g. moving the cursor within a
-    /// table with `j`/`k`), the existing `active_content` is reused and only the
-    /// cursor is moved. Recreating `Content::with_text` on every step resets the
-    /// `text_editor` widget's internal state — including its syntax-highlighter
-    /// cache — forcing a full re-highlight of the entire table on the next
-    /// render. Skipping the recreation keeps table navigation at cursor-speed.
+    /// table with `j`/`k`), the text the editor holds is left alone and only
+    /// the cursor is moved. Replacing the text restarts the editor's
+    /// highlighting and shaping for the whole region; skipping it keeps table
+    /// navigation at cursor-speed.
     fn activate_line(&mut self, line: usize, column: usize) {
         self.set_active(line, column, true);
     }
@@ -1764,12 +2443,59 @@ impl MarkdownEditor {
         self.set_active(line, column, false);
     }
 
+    /// Widen the region over any code block it cuts through, keeping the
+    /// caret and selection where they are.
+    ///
+    /// Only an edit can cause that — typing a fence that pairs up with one
+    /// further down — and a region that splits a code block renders what is
+    /// left of it as broken fragments.
+    fn snap_region_to_fences(&mut self) {
+        let start = self
+            .region_bounds(self.active_start)
+            .0
+            .min(self.active_start);
+        let end = self
+            .region_bounds(self.active_end - 1)
+            .1
+            .max(self.active_end);
+
+        if (start, end) == (self.active_start, self.active_end) {
+            return;
+        }
+
+        let (anchor, head) = self.selection_span();
+        self.reshape_region(start, end, anchor, head);
+        // Widened for a code block, not for a selection: nothing to shrink
+        // back from once the selection is gone.
+        self.selection_region = anchor != head;
+    }
+
+    /// The line range edited as raw source when the cursor is on `line`.
+    ///
+    /// Some constructs cannot be edited a line at a time without falling
+    /// apart, so the whole of one becomes the raw region:
+    ///
+    /// * a fenced code block — split at the cursor, its fences no longer
+    ///   pair up and the code on either side renders as stray paragraphs and
+    ///   empty code boxes, changing shape on every step through it;
+    /// * a table — a row on its own is not a table, and the rest of it would
+    ///   render as an invalid fragment.
+    ///
+    /// Any other line stands alone.
+    fn region_bounds(&mut self, line: usize) -> (usize, usize) {
+        self.refresh_fences();
+
+        fences::block_at(&self.fences, line)
+            .or_else(|| table_bounds(&self.lines, line))
+            .unwrap_or((line, line + 1))
+    }
+
     fn set_active(&mut self, line: usize, column: usize, may_reuse: bool) {
         // Placing the cursor somewhere ends any selection, and with it the
         // only reason the region might have been widened past the cursor line.
         self.selection_region = false;
 
-        let (start, end) = active_bounds(&self.lines, line);
+        let (start, end) = self.region_bounds(line);
 
         // Moving somewhere else ends the current run of edits, so the next one
         // becomes its own undo step.
@@ -1793,35 +2519,78 @@ impl MarkdownEditor {
         self.active_start = start;
         self.active_end = end;
 
-        let editor_line = line - start;
-        let target_column = clamp_column(&self.lines[line], column);
+        let position = text_editor::Position {
+            line: line - start,
+            column: clamp_column(&self.lines[line], column),
+        };
 
-        if reuse_content {
-            // The content already holds the correct text; just move the cursor.
-            // Always call `move_to` because the cursor is at its old position.
-            // It cannot *clear* a selection though (`Cursor::selection: None`
-            // means "leave it alone", not "drop it"), so an old selection is
-            // collapsed first — placing the cursor must never leave one behind.
-            self.clear_selection();
-            self.active_content.move_to(text_editor::Cursor {
-                position: text_editor::Position {
-                    line: editor_line,
-                    column: target_column,
-                },
-                selection: None,
-            });
-        } else {
-            self.active_content =
-                text_editor::Content::with_text(&self.lines[start..end].join("\n"));
-            if editor_line > 0 || target_column > 0 {
+        if !reuse_content {
+            self.replace_content(start..end);
+        }
+        // With the content reused, the cursor is still wherever it was.
+        self.place_caret(position);
+    }
+
+    /// Make the raw editor hold the document lines in `range`.
+    ///
+    /// The text of the existing `Content` is replaced by an edit rather than
+    /// the `Content` itself by a new one. A new one is shaped in full as soon
+    /// as it is created, in the default font, and again at its first layout
+    /// in the editor's font; an edited one keeps the font it was laid out
+    /// with, and its new lines are shaped once. On a hundred-line code block
+    /// that halves the cost of the caret entering it.
+    fn replace_content(&mut self, range: Range<usize>) {
+        let text = self.lines[range.clone()].join("\n");
+
+        self.active_content.perform(text_editor::Action::SelectAll);
+        self.active_content
+            .perform(text_editor::Action::Edit(text_editor::Edit::Paste(
+                Arc::new(text),
+            )));
+
+        debug_assert_eq!(self.active_content.line_count(), range.len());
+    }
+
+    /// Put the caret at `position` in the raw editor, with nothing selected.
+    ///
+    /// Where a wrapped line breaks, one offset is two places on screen: the
+    /// end of one row and the start of the next. `Content::move_to` always
+    /// picks the end of the row — so a caret put at the start of a row would
+    /// show on the row above, and the next `↑` would skip a row. Stepping
+    /// back onto the offset from the character after it picks the start
+    /// instead, which is where a caret is put in every other case: nothing
+    /// else lands exactly on a wrap point.
+    fn place_caret(&mut self, position: text_editor::Position) {
+        // `move_to` cannot *clear* a selection (`Cursor::selection: None`
+        // means "leave it alone", not "drop it"), so an old one is collapsed
+        // first: placing the caret must never leave one behind.
+        self.clear_selection();
+
+        // Where the character after the caret ends, if there is one.
+        let next = self.active_content.line(position.line).and_then(|line| {
+            let column = position.column.min(line.text.len());
+            line.text[column..]
+                .chars()
+                .next()
+                .map(|ch| column + ch.len_utf8())
+        });
+
+        match next {
+            Some(next) if position.column > 0 => {
                 self.active_content.move_to(text_editor::Cursor {
                     position: text_editor::Position {
-                        line: editor_line,
-                        column: target_column,
+                        column: next,
+                        ..position
                     },
                     selection: None,
                 });
+                self.active_content
+                    .perform(text_editor::Action::Move(text_editor::Motion::Left));
             }
+            _ => self.active_content.move_to(text_editor::Cursor {
+                position,
+                selection: None,
+            }),
         }
     }
 
@@ -1928,9 +2697,9 @@ impl MarkdownEditor {
     /// else has to understand selection — copy, cut, paste and delete all keep
     /// working exactly as they do on a single line.
     ///
-    /// The range is snapped outwards to whole tables, so a selection that ends
-    /// halfway down one does not leave the remaining rows rendering as an
-    /// invalid fragment.
+    /// The range is snapped outwards to whole tables and code blocks, so a
+    /// selection that ends halfway down one does not leave the rest of it
+    /// rendering as an invalid fragment.
     fn reshape_region(
         &mut self,
         start: usize,
@@ -1939,8 +2708,8 @@ impl MarkdownEditor {
         head: (usize, usize),
     ) {
         let last = self.lines.len() - 1;
-        let start = active_bounds(&self.lines, start.min(last)).0;
-        let end = active_bounds(&self.lines, end.clamp(start + 1, last + 1) - 1).1;
+        let start = self.region_bounds(start.min(last)).0;
+        let end = self.region_bounds(end.clamp(start + 1, last + 1) - 1).1;
 
         // Changing the selection is a deliberate move to somewhere else, so
         // the next edit starts its own undo step rather than being folded into
@@ -1948,11 +2717,10 @@ impl MarkdownEditor {
         self.history.break_run();
 
         if start != self.active_start || end != self.active_end {
-            // Rebuilding drops the widget's highlighter cache, so it is only
-            // done when the text the editor holds actually changes.
+            // Replacing the text restarts the highlighter, so it is only done
+            // when the text the editor holds actually changes.
             if !content_matches(&self.active_content, &self.lines[start..end]) {
-                self.active_content =
-                    text_editor::Content::with_text(&self.lines[start..end].join("\n"));
+                self.replace_content(start..end);
             }
 
             self.active_start = start;
@@ -2013,7 +2781,7 @@ impl MarkdownEditor {
                 anchor,
                 target,
             );
-            return self.reveal_line(target.0);
+            return Task::none();
         }
 
         let (start, end) = match motion {
@@ -2034,12 +2802,12 @@ impl MarkdownEditor {
         self.reshape_region(start, end, anchor, head);
         // The editor performs the motion itself, so wrapped lines, word
         // boundaries and the caret's preferred column all behave exactly as
-        // they do inside a single line.
+        // they do inside a single line. `update` then keeps the moving end of
+        // the selection on screen.
         self.active_content
             .perform(text_editor::Action::Select(motion));
 
-        let (_, head) = self.selection_span();
-        self.reveal_line(head.0)
+        Task::none()
     }
 
     /// Where a page motion lands, in document coordinates, or `None` when
@@ -2049,11 +2817,11 @@ impl MarkdownEditor {
         motion: text_editor::Motion,
         head: (usize, usize),
     ) -> Option<(usize, usize)> {
-        let page = self.page_lines();
-
         let line = match motion {
-            text_editor::Motion::PageUp => head.0.saturating_sub(page),
-            text_editor::Motion::PageDown => (head.0 + page).min(self.lines.len() - 1),
+            text_editor::Motion::PageUp => head.0.saturating_sub(self.page_lines(head.0, false)),
+            text_editor::Motion::PageDown => {
+                (head.0 + self.page_lines(head.0, true)).min(self.lines.len() - 1)
+            }
             _ => return None,
         };
 
@@ -2086,9 +2854,9 @@ impl MarkdownEditor {
             head,
         );
 
-        // Keep the moving end of the selection on screen, so a drag towards
-        // the edge of the window carries on scrolling the document.
-        self.reveal_line(line)
+        // `update` keeps the moving end of the selection on screen, so a drag
+        // towards the edge of the window carries on scrolling the document.
+        Task::none()
     }
 
     /// Shrink a selection-widened region back onto the cursor's line once the
@@ -2106,7 +2874,7 @@ impl MarkdownEditor {
 
         let (line, column) = self.cursor_position();
         let line = line.min(self.lines.len() - 1);
-        let (start, end) = active_bounds(&self.lines, line);
+        let (start, end) = self.region_bounds(line);
 
         self.selection_region = false;
         if start == self.active_start && end == self.active_end {
@@ -2134,12 +2902,24 @@ impl MarkdownEditor {
         self.record_change(start, old_len, new_len, self.cursor_position());
 
         if new_len == old_len {
+            // Typing only ever rewrites the region, so the segments and
+            // blocks around it stay exactly as they were — unless the edit
+            // made or unmade a code fence, which changes how everything after
+            // it splits into blocks.
+            let fences_before = fences::signature(&self.lines[start..self.active_end]);
+
             for offset in 0..new_len {
                 if let Some(line) = self.active_content.line(offset) {
                     let target = &mut self.lines[start + offset];
                     target.clear();
                     target.push_str(&line.text);
                 }
+            }
+
+            self.revision += 1;
+            if fences::signature(&self.lines[start..self.active_end]) != fences_before {
+                self.fences_dirty = true;
+                self.structure_changed = true;
             }
         } else {
             let replacement: Vec<String> = (0..new_len)
@@ -2151,11 +2931,10 @@ impl MarkdownEditor {
                 })
                 .collect();
 
-            self.lines.splice(start..self.active_end, replacement);
+            // Only the segments *after* the region move, by the number of
+            // lines gained or lost; `sync` slides them along.
+            self.splice_lines(start..self.active_end, replacement);
             self.active_end = start + new_len;
-            // Only the segments *after* the active one move, and only by the
-            // number of lines gained or lost.
-            self.shift_segments_after_active(new_len as isize - old_len as isize);
         }
     }
 
@@ -2190,7 +2969,7 @@ impl MarkdownEditor {
             cursor: self.cursor_position(),
         };
 
-        self.lines.splice(start..end, change.before);
+        self.splice_lines(start..end, change.before);
         // `lines` must never be empty; a change always restores at least one.
         debug_assert!(!self.lines.is_empty());
 
@@ -2224,8 +3003,11 @@ impl MarkdownEditor {
         }
     }
 
-    /// Make the highlighted match's line active, select the match, and scroll
-    /// it into view.
+    /// Make the highlighted match's line active, select the match, and bring
+    /// it into view with the lines above it for context.
+    ///
+    /// Nothing moves when nothing matched: typing a query that finds nothing
+    /// must not pull the view back to the caret.
     fn reveal_current_match(&mut self) -> Task<Message> {
         let Some(hit) = self.search.as_ref().and_then(Search::current_match) else {
             return Task::none();
@@ -2234,12 +3016,12 @@ impl MarkdownEditor {
             return Task::none();
         }
 
-        // Rebuild the region: the match's line becomes the raw editor, so the
-        // text being replaced is shown as source rather than rendered.
+        // The match's line becomes the raw editor, so the text being replaced
+        // is shown as source rather than rendered.
         self.reactivate_line(hit.line, hit.start);
-        self.rebuild();
         self.select_in_active(hit);
-        self.scroll_to_line(hit.line)
+        self.request_reveal(RevealMode::Center);
+        Task::none()
     }
 
     /// Select `hit` inside the active editor.
@@ -2282,16 +3064,18 @@ impl MarkdownEditor {
         // A replacement is its own undo step, never folded into typing.
         self.history.break_run();
         self.record_change(hit.line, 1, 1, (hit.line, hit.start));
+        let fences_before = fences::signature(&self.lines[hit.line..=hit.line]);
         self.lines[hit.line].replace_range(hit.start..hit.end, &replacement);
+        self.touch_lines(hit.line..hit.line + 1, &fences_before);
         self.is_dirty = true;
         self.history.break_run();
+        self.refresh_active_content();
 
         // The line changed, so every match after it on that line moved.
         self.refresh_search();
         if let Some(search) = &mut self.search {
             search.anchor_to(hit.line);
         }
-        self.rebuild();
         self.reveal_current_match()
     }
 
@@ -2314,6 +3098,7 @@ impl MarkdownEditor {
 
         self.history.break_run();
         self.record_change(first, last - first + 1, last - first + 1, (first, 0));
+        let fences_before = fences::signature(&self.lines[first..=last]);
 
         // Applied back to front so each replacement's byte offsets are still
         // valid when it is made.
@@ -2323,13 +3108,30 @@ impl MarkdownEditor {
             }
         }
 
+        // Replacing can blank a line out, which changes the segmentation.
+        self.touch_lines(first..last + 1, &fences_before);
         self.is_dirty = true;
         self.history.break_run();
+        self.refresh_active_content();
 
-        // Replacing can blank a line out, which changes the segmentation.
         self.refresh_search();
-        self.rebuild();
         self.reveal_current_match()
+    }
+
+    /// Make the raw editor hold the region's lines again after they were
+    /// changed from outside it — by a replacement — with the caret as close
+    /// to where it was as the new text allows.
+    ///
+    /// The editor writes every edit back line for line, so if it went on
+    /// showing the old text, the next key press would put the old text back.
+    fn refresh_active_content(&mut self) {
+        let region = &self.lines[self.active_start..self.active_end];
+        if content_matches(&self.active_content, region) {
+            return;
+        }
+
+        let (line, column) = self.cursor_position();
+        self.reactivate_line(line.min(self.lines.len() - 1), column);
     }
 
     /// The cursor as a `(document line, byte column)` pair.
@@ -2383,113 +3185,6 @@ fn mouse_release() -> Subscription<Message> {
     })
 }
 
-/// Wrap a rendered segment so the pointer can reach the document through it.
-///
-/// Pressing it puts the cursor on `line`; while `dragging`, the pointer
-/// *entering* it extends the selection to that line. `on_enter` is only
-/// attached during a drag because it fires on plain hovering too, and a
-/// message per hovered line would run a full update cycle for every mouse
-/// move across the document.
-fn selectable<'a>(body: Element<'a, Message>, line: usize, dragging: bool) -> Element<'a, Message> {
-    let area = mouse_area(body).on_press(Message::Activate(line));
-
-    if dragging {
-        area.on_enter(Message::DragTo(line)).into()
-    } else {
-        area.into()
-    }
-}
-
-/// Scroll the document to its very top.
-///
-/// A *relative* snap, so it lands on the first pixel of the real content. The
-/// absolute equivalent would have to come from the estimated `line_offsets`,
-/// which is only ever an approximation of the rendered layout.
-fn scroll_to_document_start() -> Task<Message> {
-    snap_document_to(0.0)
-}
-
-/// Scroll the document to its very bottom — see [`scroll_to_document_start`].
-fn scroll_to_document_end() -> Task<Message> {
-    snap_document_to(1.0)
-}
-
-/// Snap the document scrollable to `y`, as a fraction of its scrollable height.
-///
-/// The horizontal offset is pinned at the start rather than taken from
-/// [`scrollable::RelativeOffset::END`], which would also snap sideways.
-fn snap_document_to(y: f32) -> Task<Message> {
-    iced::widget::operation::snap_to(DOCUMENT_ID, scrollable::RelativeOffset { x: 0.0, y })
-}
-
-/// Whether handling `message` can change the set of rendered blocks (the
-/// document text or the active region).
-///
-/// Used by [`MarkdownEditor::update`] to skip the full block re-parse for
-/// messages that only move the cursor, follow a link, or report file-I/O
-/// status.
-fn message_affects_blocks(message: &Message) -> bool {
-    match message {
-        // A raw-editor action never changes the *rendered* blocks, so it never
-        // needs a rebuild — not even when it is an edit.
-        //
-        // The active region is painted straight from `active_content`, never from
-        // `blocks`. An edit only ever rewrites lines *inside* that region, so:
-        //   * every non-active block keeps its exact source text, and
-        //   * the number and order of `Segment::Block`s is unchanged (adding or
-        //     removing lines inside the active region only shifts the indices of
-        //     the blocks that follow it, never their contents),
-        // which means a rebuild would reproduce `blocks` byte-for-byte. Skipping
-        // it keeps typing at editor-native speed regardless of document size.
-        // Structural edits that *do* move the active region (Enter on a stand-
-        // alone line, Backspace/Delete at a region edge) arrive as their own
-        // messages (`SplitLine`, `MergeWith*`, …) and still trigger a rebuild.
-        Message::EditorAction(_) => false,
-        // These never touch `lines` or the active range. A theme change only
-        // affects rendering style at view time, not the parsed blocks.
-        Message::LinkClicked(_)
-        | Message::OpenFile
-        | Message::SaveFile
-        | Message::FileSaved(_)
-        | Message::Scrolled { .. }
-        // Preferences restyle and re-measure the document, but never re-parse
-        // it: the blocks are the same Markdown either way. The handlers that
-        // change a size call `remeasure` themselves.
-        | Message::ThemeChanged(_)
-        | Message::ToggleSettingsPanel
-        | Message::Dismiss
-        | Message::ToggleToolbar
-        | Message::ToggleStatusBar
-        | Message::FontSizeChanged(_)
-        | Message::WrapWidthChanged(_)
-        | Message::ToggleRestoreSession
-        | Message::ResetSettings
-        | Message::ToggleColorPanel
-        | Message::ColorHexChanged(_, _)
-        | Message::ColorPicked(_, _)
-        | Message::ColorReset(_)
-        | Message::ResetAllColors
-        // The search bar drives its own rebuilds when it moves the active
-        // region; these variants only touch the bar's own state.
-        | Message::CloseSearch
-        | Message::ReplacementChanged(_)
-        | Message::ToggleSearchCase
-        | Message::SearchQueryChanged(_)
-        | Message::FindNext
-        | Message::FindPrevious
-        | Message::ReplaceCurrent
-        | Message::ReplaceAll
-        | Message::OpenSearch { .. }
-        // Releasing the mouse only forgets the drag anchor; the selection it
-        // produced is already in place.
-        | Message::DragEnd => false,
-        // Everything else may change the document or the active region —
-        // including the selection messages, which widen the raw region and so
-        // change which lines are rendered as Markdown.
-        _ => true,
-    }
-}
-
 /// Whether the editor's content holds exactly `lines`, one editor line per
 /// entry.
 ///
@@ -2511,31 +3206,56 @@ fn content_matches(content: &text_editor::Content, lines: &[String]) -> bool {
 ///
 /// The active range and blank lines are their own segments; every other
 /// contiguous run of lines becomes a single [`Segment::Block`] so multi-line
-/// Markdown constructs render together.
+/// Markdown constructs render together. A blank line inside a fenced code
+/// block is part of the code, not a break between blocks: splitting there
+/// rendered one code block as two broken halves.
 ///
 /// `out` is cleared and refilled so its allocation is reused across rebuilds.
 fn collect_segments(
     lines: &[String],
+    code_blocks: &[(usize, usize)],
     active_start: usize,
     active_end: usize,
     out: &mut Vec<Segment>,
 ) {
     out.clear();
-    let mut index = 0;
+    walk_segments(
+        lines,
+        code_blocks,
+        (active_start, active_end),
+        0..lines.len(),
+        out,
+    );
+}
 
-    while index < lines.len() {
+/// Append the [`Segment`]s of `lines[range]` to `out`, as a walk of the whole
+/// document would produce them — provided `range` starts and ends at a
+/// segment boundary.
+fn walk_segments(
+    lines: &[String],
+    code_blocks: &[(usize, usize)],
+    (active_start, active_end): (usize, usize),
+    range: Range<usize>,
+    out: &mut Vec<Segment>,
+) {
+    let continues_block =
+        |index: usize| !lines[index].trim().is_empty() || fences::in_code(code_blocks, index);
+    let stop = range.end.min(lines.len());
+    let mut index = range.start;
+
+    while index < stop {
         if index == active_start {
             out.push(Segment::Active);
             // `active_start < active_end` always holds, but force forward
             // progress regardless: a zero-width active range would otherwise
             // spin forever and freeze the window (requiring a hard kill).
             index = active_end.max(index + 1);
-        } else if lines[index].trim().is_empty() {
+        } else if !continues_block(index) {
             out.push(Segment::Blank(index));
             index += 1;
         } else {
             let start = index;
-            while index < lines.len() && index != active_start && !lines[index].trim().is_empty() {
+            while index < stop && index != active_start && continues_block(index) {
                 index += 1;
             }
             out.push(Segment::Block { start, end: index });
@@ -2561,37 +3281,34 @@ fn block_source_eq(lines: &[String], range: (usize, usize), source: &str) -> boo
     parts.next().is_none()
 }
 
-/// Line range to render as real elements, or `None` when the whole document
-/// should be rendered (no viewport yet, or the window already covers every
-/// line). Off-screen segments outside this range become height placeholders in
-/// [`MarkdownEditor::view`] so the scrollable's content height stays stable.
+/// Lines `first..last` to render as real widgets, or `None` when the whole
+/// document should be rendered (no viewport yet, or the window already covers
+/// every line). Segments outside it are stood in for by spacers.
 ///
-/// The scroll offset (in content pixels) is mapped to a line index through
-/// `line_offsets`, the *same* geometry the placeholders are sized with. It is
-/// still approximate — headings and code deviate from the estimate — but only
-/// the few real blocks *inside* the overscan contribute their real height to
-/// the offset, so the cumulative error at the viewport is bounded by the
-/// overscan and far too small to reach the screen.
-fn visible_line_window(
+/// The window spans the visible screen plus [`OVERSCAN_ABOVE`] and
+/// [`OVERSCAN_BELOW`] screens, mapped to lines through `line_offsets` — the
+/// *same* geometry the spacers are sized with, so what the window expects to
+/// be on screen is what the layout puts there.
+fn render_window(
     viewport: Option<(f32, f32)>,
     line_offsets: &[f32],
     total_lines: usize,
-) -> Option<(i64, i64)> {
+) -> Option<(usize, usize)> {
     let (offset_y, view_height) = viewport?;
 
-    let first = line_at_offset(line_offsets, offset_y) as i64;
-    let last = line_at_offset(line_offsets, offset_y + view_height) as i64 + 1;
+    let top = offset_y - view_height * OVERSCAN_ABOVE;
+    let bottom = offset_y + view_height * (1.0 + OVERSCAN_BELOW);
 
-    let start = first - SCROLL_OVERSCAN_LINES;
-    let end = last + SCROLL_OVERSCAN_LINES;
+    let first = if top <= 0.0 {
+        0
+    } else {
+        line_at_offset(line_offsets, top)
+    };
+    let last = (line_at_offset(line_offsets, bottom) + 1).min(total_lines);
 
     // The window already spans the whole document: render everything and skip
-    // placeholders (keeps small documents on the exact original code path).
-    if start <= 0 && end >= total_lines as i64 {
-        return None;
-    }
-
-    Some((start, end))
+    // the spacers (keeps small documents on the plain code path).
+    (first > 0 || last < total_lines).then_some((first, last))
 }
 
 /// Index of the line occupying content pixel `y`, per the cumulative
@@ -2604,12 +3321,20 @@ fn line_at_offset(line_offsets: &[f32], y: f32) -> usize {
         .saturating_sub(1)
 }
 
+/// Size of rendered code relative to body text, as iced's Markdown settings
+/// derive it.
+const CODE_SCALE: f32 = 0.75;
+
+/// Height of a line of rendered code relative to an estimated body line: set
+/// at [`CODE_SCALE`], and without the padding every segment has of its own.
+const CODE_ROW: f32 = 0.52;
+
 /// Layout estimates for one combination of font size and text width.
 ///
 /// [`EST_LINE_HEIGHT`] and [`EST_CHARS_PER_LINE`] are calibrated for
 /// [`settings::BASE_FONT_SIZE`]; both scale with the configured size, in
 /// opposite directions. Bundling them keeps the render window
-/// ([`visible_line_window`]) and the `line_offsets` table derived from the same
+/// ([`render_window`]) and the `line_offsets` table derived from the same
 /// numbers — deriving them separately is what desynchronises the viewport.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Metrics {
@@ -2617,6 +3342,8 @@ struct Metrics {
     line_height: f32,
     /// Estimated characters that fit on one visual line.
     chars_per_line: u32,
+    /// Font scale relative to [`settings::BASE_FONT_SIZE`].
+    scale: f32,
 }
 
 impl Metrics {
@@ -2635,6 +3362,23 @@ impl Metrics {
         Self {
             line_height: EST_LINE_HEIGHT * scale,
             chars_per_line: by_window.min(by_wrap).max(1.0) as u32,
+            scale,
+        }
+    }
+
+    /// Wrap by the document's real `width`, once it has been laid out,
+    /// rather than by an assumed window width.
+    fn measured(self, width: Option<f32>) -> Self {
+        let Some(width) = width else {
+            return self;
+        };
+
+        let text = width - 2.0 * f32::from(LINE_PADDING);
+        let fits = (text / (EST_CHAR_WIDTH * self.scale)).max(1.0) as u32;
+
+        Self {
+            chars_per_line: fits,
+            ..self
         }
     }
 }
@@ -2645,38 +3389,60 @@ impl Default for Metrics {
     }
 }
 
-/// Estimated rendered height (px) of a single source line.
+/// Estimated rendered height (px) of a single source line, `in_code` when it
+/// sits between the fences of a code block.
 ///
 /// A line is at least one visual line, plus extra for wrapping based on byte
-/// length (no UTF-8 decode, so multi-byte text only ever over-estimates —
-/// safe for windowing).
-fn estimate_line_height(line: &str, metrics: Metrics) -> f32 {
-    let wrapped = (line.len() as u32).div_ceil(metrics.chars_per_line).max(1);
-    wrapped as f32 * metrics.line_height
+/// length (no UTF-8 decode, so multi-byte text only ever over-estimates).
+/// Headings are scaled up by their level. Code is set smaller and never wraps
+/// (it scrolls sideways); a fence line renders as the code box's padding,
+/// which is about as tall as a line of code.
+fn estimate_line_height(line: &str, in_code: bool, metrics: Metrics) -> f32 {
+    if in_code || fences::is_fence(line) {
+        return metrics.line_height * CODE_ROW;
+    }
+
+    let (prefix, scale) = rendered_prefix(line);
+    let wrapped = ((line.len() - prefix) as f32 * scale / metrics.chars_per_line as f32)
+        .ceil()
+        .max(1.0);
+
+    wrapped * scale * metrics.line_height
 }
 
-/// Estimated pixel height of the block spanning `lines[start..end]`, used for
-/// off-screen placeholders so the scrollable's content height tracks the real
-/// document size.
-///
-/// Each source line is treated as at least one visual line, with extra lines
-/// for wrapping based on byte length (no UTF-8 decode, so multi-byte text only
-/// ever over-estimates — safe for windowing). Headings and code blocks deviate
-/// by a few pixels, absorbed by [`SCROLL_OVERSCAN_LINES`].
-fn estimate_segment_height(lines: &[String], start: usize, end: usize, metrics: Metrics) -> f32 {
-    lines[start..end]
-        .iter()
-        .map(|line| estimate_line_height(line, metrics))
-        .sum()
+/// How a line's rendering differs from its source at its start: the bytes
+/// of Markdown syntax that do not show (a heading's `#`s), and the size the
+/// rest is rendered at relative to body text.
+fn rendered_prefix(line: &str) -> (usize, f32) {
+    let hashes = line.bytes().take_while(|&byte| byte == b'#').count();
+    let is_heading = (1..=6).contains(&hashes)
+        && line[hashes..]
+            .chars()
+            .next()
+            .is_none_or(char::is_whitespace);
+
+    if !is_heading {
+        return (0, 1.0);
+    }
+
+    // The sizes `markdown::Settings::with_text_size` gives each level.
+    let scale = match hashes {
+        1 => 2.0,
+        2 => 1.75,
+        3 => 1.5,
+        4 => 1.25,
+        _ => 1.0,
+    };
+    let prefix = hashes + (line.len() - hashes - line[hashes..].trim_start().len());
+
+    (prefix, scale)
 }
 
-/// Determine the contiguous line range to edit as raw source when the cursor is
-/// on `line`.
-///
-/// A line inside a Markdown table expands to cover the whole table so it can be
-/// edited without breaking the table's rendering; any other line stands alone.
-fn active_bounds(lines: &[String], line: usize) -> (usize, usize) {
-    table_bounds(lines, line).unwrap_or((line, line + 1))
+/// Byte offset of the character `chars` characters into `text`, or its end.
+fn char_offset(text: &str, chars: usize) -> usize {
+    text.char_indices()
+        .nth(chars)
+        .map_or(text.len(), |(offset, _)| offset)
 }
 
 /// If `lines[line]` belongs to a GFM table, return the table's line range
@@ -2747,8 +3513,42 @@ fn is_table_row(line: &str) -> bool {
 }
 
 /// Split text into logical lines. Always returns at least one element.
+///
+/// Lines break exactly where the raw editor's text engine breaks them — at
+/// `\n`, `\r\n`, `\n\r` and a lone `\r` — so the lines of the active region
+/// and the lines the editor holds always correspond one to one. Splitting at
+/// `\n` alone left a `\r` at the end of every line of a Windows file, which
+/// the editor took for a line break of its own: every edit then wrote an extra
+/// empty line back into the document.
+///
+/// A final line ending leaves a final empty line, as it does in the editor.
 fn split_lines(text: &str) -> Vec<String> {
-    text.split('\n').map(String::from).collect()
+    let mut lines = Vec::new();
+    let mut rest = text;
+
+    while let Some(at) = rest.find(['\r', '\n']) {
+        lines.push(rest[..at].to_owned());
+
+        let ending = &rest[at..];
+        let length = if ending.starts_with("\r\n") || ending.starts_with("\n\r") {
+            2
+        } else {
+            1
+        };
+        rest = &ending[length..];
+    }
+
+    lines.push(rest.to_owned());
+    lines
+}
+
+/// The line ending `text` uses, judged by its first line break: `\r\n` for a
+/// Windows file, `\n` for everything else.
+fn line_ending_of(text: &str) -> &'static str {
+    match text.find('\n') {
+        Some(at) if text[..at].ends_with('\r') => "\r\n",
+        _ => "\n",
+    }
 }
 
 /// Column at which a word- or line-selection of `text` begins on `line`.
@@ -2995,6 +3795,9 @@ fn editor_binding(
 }
 
 #[cfg(test)]
+mod headless;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -3003,11 +3806,29 @@ mod tests {
     }
 
     /// Convenience wrapper: the production walker fills a caller-owned buffer
-    /// so it can reuse the allocation, which is noise in a test.
+    /// so it can reuse the allocation, and takes the fences precomputed, which
+    /// is noise in a test.
     fn segments(lines: &[String], active_start: usize, active_end: usize) -> Vec<Segment> {
         let mut out = Vec::new();
-        collect_segments(lines, active_start, active_end, &mut out);
+        collect_segments(
+            lines,
+            &fences::blocks(lines),
+            active_start,
+            active_end,
+            &mut out,
+        );
         out
+    }
+
+    /// A press at the very start of rendered `line`, beside its text.
+    fn click(line: usize) -> Message {
+        Message::ClickAt(Press {
+            segment: (line, line + 1),
+            line,
+            x: 0.0,
+            fraction: 0.0,
+            text: None,
+        })
     }
 
     #[test]
@@ -3076,19 +3897,19 @@ mod tests {
 
     // -- Windowed rendering ---------------------------------------------
     //
-    // `visible_line_window` and `estimate_segment_height` drive the
-    // virtualization in `view`; they are pure functions, so they get their own
-    // unit tests independent of the widget tree.
+    // `render_window` and `estimate_line_height` drive the virtualization in
+    // `view`; they are pure functions, so they get their own unit tests
+    // independent of the widget tree.
 
     /// The cumulative line-offset table for a document of uniform, non-wrapping
-    /// lines — the geometry `visible_line_window` maps offsets through.
+    /// lines — the geometry `render_window` maps offsets through.
     fn offsets_for(lines: &[String]) -> Vec<f32> {
         let metrics = Metrics::default();
         let mut offsets = Vec::with_capacity(lines.len() + 1);
         let mut top = 0.0;
         for line in lines {
             offsets.push(top);
-            top += estimate_line_height(line, metrics);
+            top += estimate_line_height(line, false, metrics);
         }
         offsets.push(top);
         offsets
@@ -3099,44 +3920,47 @@ mod tests {
     }
 
     #[test]
-    fn visible_line_window_renders_all_without_a_viewport() {
+    fn render_window_renders_all_without_a_viewport() {
         // No layout has happened yet (first frame, or tests): render everything
         // so small documents and the test suite keep the original behaviour.
-        assert_eq!(
-            visible_line_window(None, &flat_offsets(10_000), 10_000),
-            None
-        );
+        assert_eq!(render_window(None, &flat_offsets(10_000), 10_000), None);
     }
 
     #[test]
-    fn visible_line_window_renders_all_when_window_covers_document() {
+    fn render_window_renders_all_when_window_covers_document() {
         // A small document scrolled to the top: the overscan already reaches
         // past the end, so there is nothing to skip.
         assert_eq!(
-            visible_line_window(Some((0.0, 600.0)), &flat_offsets(20), 20),
+            render_window(Some((0.0, 600.0)), &flat_offsets(20), 20),
             None
         );
     }
 
     #[test]
-    fn visible_line_window_crops_a_scrolled_large_document() {
+    fn render_window_crops_a_scrolled_large_document() {
         // 8 000 lines, scrolled ~halfway down a 1 000 px viewport. The window
         // must be a bounded line range (not `None`) covering the visible lines.
         let offsets = flat_offsets(8_000);
-        let win = visible_line_window(Some((50_000.0, 1_000.0)), &offsets, 8_000);
+        let win = render_window(Some((50_000.0, 1_000.0)), &offsets, 8_000);
         let (start, end) = win.expect("a large scrolled document is windowed");
 
-        // offset_y / EST_LINE_HEIGHT ≈ 2 083 → first visible line ~2 083.
-        let first_visible = (50_000.0 / EST_LINE_HEIGHT).floor() as i64;
+        // offset_y / EST_LINE_HEIGHT ≈ 1 666 → first visible line ~1 666.
+        let first_visible = (50_000.0 / EST_LINE_HEIGHT).floor() as usize;
+        let last_visible = (51_000.0 / EST_LINE_HEIGHT).ceil() as usize;
+
+        // Overscan reaches a screen past the top of the viewport, and further
+        // past its bottom.
+        let screen = (1_000.0 / EST_LINE_HEIGHT) as usize;
         assert!(
-            start <= first_visible && end >= first_visible,
-            "window {start}..{end} must cover the first visible line {first_visible}"
+            start + screen <= first_visible + 1,
+            "overscan before the viewport"
         );
-        // Overscan reaches past both ends of the visible region.
-        assert!(start < first_visible, "overscan before the viewport");
+        assert!(end >= last_visible + screen, "overscan after the viewport");
+
+        // ...but no further: the widget tree must stay a few screens large.
         assert!(
-            end > first_visible + (1_000.0 / EST_LINE_HEIGHT) as i64,
-            "overscan after the viewport"
+            end - start < 5 * screen,
+            "window {start}..{end} is too wide"
         );
     }
 
@@ -3146,7 +3970,7 @@ mod tests {
     /// from what was on screen for any document with wrapping lines, so the
     /// viewport showed nothing but blank placeholders.
     #[test]
-    fn visible_line_window_agrees_with_placeholder_geometry_when_lines_wrap() {
+    fn render_window_agrees_with_placeholder_geometry_when_lines_wrap() {
         // Paragraphs of ~270 bytes: each wraps to three visual lines.
         let long = "x".repeat(270);
         let lines = to_lines(
@@ -3160,12 +3984,11 @@ mod tests {
         let total = *offsets.last().unwrap();
         let offset_y = total / 2.0 - view_height / 2.0;
 
-        let (start, end) =
-            visible_line_window(Some((offset_y, view_height)), &offsets, lines.len())
-                .expect("a large scrolled document is windowed");
+        let (start, end) = render_window(Some((offset_y, view_height)), &offsets, lines.len())
+            .expect("a large scrolled document is windowed");
 
         // The line genuinely at that offset, by the placeholders' own geometry.
-        let on_screen = line_at_offset(&offsets, offset_y) as i64;
+        let on_screen = line_at_offset(&offsets, offset_y);
         assert!(
             start <= on_screen && on_screen < end,
             "window {start}..{end} must contain the line actually on screen ({on_screen})"
@@ -3192,29 +4015,53 @@ mod tests {
         editor.rebuild();
 
         assert_eq!(editor.line_offsets.len(), editor.lines.len() + 1);
+        assert_eq!(editor.line_heights.len(), editor.lines.len());
         assert_eq!(editor.line_offsets[0], 0.0);
+
+        let metrics = editor.metrics();
+        let total: f32 = editor
+            .lines
+            .iter()
+            .map(|line| estimate_line_height(line, false, metrics))
+            .sum();
+        assert_eq!(*editor.line_offsets.last().unwrap(), total);
+    }
+
+    #[test]
+    fn estimate_line_height_counts_wrapped_lines() {
+        let metrics = Metrics::default();
+        let long = "x".repeat(200); // > EST_CHARS_PER_LINE → ≥3 visual lines
+
+        // A 200-char line wraps to ceil(200/90) = 3 visual lines.
         assert_eq!(
-            *editor.line_offsets.last().unwrap(),
-            estimate_segment_height(&editor.lines, 0, editor.lines.len(), editor.metrics())
+            estimate_line_height(&long, false, metrics),
+            200u32.div_ceil(EST_CHARS_PER_LINE) as f32 * EST_LINE_HEIGHT
+        );
+
+        // A single short line is at least one line tall.
+        assert_eq!(
+            estimate_line_height("short", false, metrics),
+            EST_LINE_HEIGHT
         );
     }
 
     #[test]
-    fn estimate_segment_height_counts_wrapped_lines() {
+    fn headings_and_code_are_estimated_at_their_rendered_size() {
         let metrics = Metrics::default();
-        let long = "x".repeat(200); // > EST_CHARS_PER_LINE → ≥3 visual lines
-        let lines = to_lines(&format!("short\n{long}"));
+        let body = estimate_line_height("Title", false, metrics);
 
-        // One short line (1 visual) + one 200-char line (ceil(200/90) = 3 visual).
-        let h = estimate_segment_height(&lines, 0, 2, metrics);
+        assert_eq!(estimate_line_height("# Title", false, metrics), body * 2.0);
         assert_eq!(
-            h,
-            (1 + 200u32.div_ceil(EST_CHARS_PER_LINE)) as f32 * EST_LINE_HEIGHT
+            estimate_line_height("### Title", false, metrics),
+            body * 1.5
         );
+        // A hash that does not open a heading is ordinary text.
+        assert_eq!(estimate_line_height("#Title", false, metrics), body);
 
-        // A single short line is at least one line tall.
-        let h0 = estimate_segment_height(&lines, 0, 1, metrics);
-        assert_eq!(h0, EST_LINE_HEIGHT);
+        // Code is set small, and a fence is little more than padding.
+        let code = estimate_line_height("let x = 1;", true, metrics);
+        assert!(code < body);
+        assert_eq!(estimate_line_height("```rust", false, metrics), code);
     }
 
     #[test]
@@ -3267,7 +4114,7 @@ mod tests {
         editor.load_document("intro\n\n| A | B |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |");
 
         // Click the table's header row.
-        let _ = editor.update(Message::Activate(2));
+        let _ = editor.update(click(2));
 
         // The whole table (lines 2..6) is now the editable region.
         assert_eq!((editor.active_start, editor.active_end), (2, 6));
@@ -3329,7 +4176,7 @@ mod tests {
 
         // A page is measured from the viewport, so it is a screenful of lines
         // — not a fixed count, and more than one line.
-        let page = editor.page_lines();
+        let page = editor.page_lines(0, true);
         assert!(page > 1, "a page must span more than one line");
         assert!(page < last, "the document must be more than one page long");
 
@@ -3373,9 +4220,9 @@ mod tests {
         editor.load_document(&doc);
         editor.rebuild();
 
-        // The emitted `Task` is opaque, so assert on the geometry it is built
-        // from: `scroll_by_lines` scrolls by the height of the lines crossed.
-        let page = editor.page_lines();
+        // The view is scrolled by the viewport, during layout; assert on the
+        // geometry it scrolls by: the height of the lines crossed.
+        let page = editor.page_lines(0, true);
         let scrolled = editor.line_top(page) - editor.line_top(0);
         assert!(
             scrolled >= editor.viewport.expect("a seeded viewport").1 * 0.9,
@@ -3398,7 +4245,8 @@ mod tests {
         editor.rebuild();
         editor.viewport = None;
 
-        assert_eq!(editor.page_lines(), PAGE_LINES);
+        assert_eq!(editor.page_lines(1, true), PAGE_LINES);
+        assert_eq!(editor.page_lines(1, false), PAGE_LINES);
     }
 
     /// A page must stay a page at the bottom of the document, where there are
@@ -3412,14 +4260,15 @@ mod tests {
         let (mut editor, _task) = MarkdownEditor::new_with_file(None);
         editor.load_document(&doc);
         editor.rebuild();
-        let page = editor.page_lines();
+        let page = editor.page_lines(0, true);
 
         // Scrolled to the bottom, as the scrollable would report it.
         let total = *editor.line_offsets.last().unwrap();
         let view_height = editor.viewport.expect("a seeded viewport").1;
         editor.viewport = Some((total - view_height, view_height));
 
-        assert_eq!(editor.page_lines(), page);
+        // Upwards from the last line: a full page, not the scrap below it.
+        assert_eq!(editor.page_lines(editor.lines.len() - 1, false), page);
 
         let _ = editor.update(Message::JumpToEnd);
         let from = editor.active_start;
@@ -3443,6 +4292,201 @@ mod tests {
         let before = editor.lines.len();
         let _ = editor.update(Message::MergeWithNext);
         assert_eq!(editor.lines.len(), before);
+    }
+
+    // -- Line endings -------------------------------------------------------
+
+    #[test]
+    fn lines_break_where_the_editor_breaks_them() {
+        assert_eq!(split_lines("a\nb"), ["a", "b"]);
+        assert_eq!(split_lines("a\r\nb\r\n"), ["a", "b", ""]);
+        assert_eq!(split_lines("a\rb"), ["a", "b"]);
+        assert_eq!(split_lines("a\n\rb"), ["a", "b"]);
+        assert_eq!(split_lines("a\n\r\nb"), ["a", "", "b"]);
+        assert_eq!(split_lines(""), [""]);
+
+        // The raw editor holds exactly the lines the document has.
+        for text in ["a\r\nb\r\n", "x\ry", "a\n\n\r\nb", "\r\n"] {
+            let content = text_editor::Content::<iced::Renderer>::with_text(text);
+            assert_eq!(content.line_count(), split_lines(text).len(), "{text:?}");
+        }
+    }
+
+    /// A Windows file is edited like any other — no stray lines appear — and
+    /// is saved with the line endings it came with.
+    #[test]
+    fn a_windows_file_keeps_its_lines_and_its_line_endings() {
+        let mut editor = editor_with("# Title\r\n\r\nfirst\r\nsecond\r\n", 2, 5);
+
+        type_text(&mut editor, "!");
+        let _ = editor.update(Message::MoveDown);
+        type_text(&mut editor, "?");
+
+        assert_eq!(editor.lines, ["# Title", "", "first!", "second?", ""]);
+        assert_eq!(
+            editor.document_text(),
+            "# Title\r\n\r\nfirst!\r\nsecond?\r\n"
+        );
+
+        // A new document is written with plain line feeds.
+        let _ = editor.update(Message::NewFile);
+        type_text(&mut editor, "x");
+        let _ = editor.update(Message::SplitLine);
+        assert_eq!(editor.document_text(), "x\n");
+    }
+
+    // -- Code blocks --------------------------------------------------------
+
+    #[test]
+    fn a_line_inside_a_code_block_makes_the_whole_block_raw() {
+        let mut editor = editor_with(
+            "intro\n\n```rust\nfn a() {}\n\nfn b() {}\n```\n\nafter",
+            0,
+            0,
+        );
+
+        // The blank line inside the code, of all places.
+        let _ = editor.update(click(4));
+
+        assert_eq!(region(&editor), (2, 7));
+        assert_eq!(editor.cursor_position(), (4, 0));
+    }
+
+    #[test]
+    fn a_blank_line_inside_code_does_not_split_its_block() {
+        let lines = to_lines("```\na\n\nb\n```\n\nafter");
+
+        assert_eq!(
+            segments(&lines, 6, 7),
+            vec![
+                Segment::Block { start: 0, end: 5 },
+                Segment::Blank(5),
+                Segment::Active,
+            ]
+        );
+    }
+
+    /// Arrowing up into a code block lands on its last line, and carries on
+    /// through it a line at a time.
+    #[test]
+    fn arrowing_up_walks_into_a_code_block_from_below() {
+        let mut editor = editor_with("```\none\ntwo\n```\nafter", 4, 0);
+
+        let _ = editor.update(Message::MoveUp);
+        assert_eq!(region(&editor), (0, 4));
+        assert_eq!(editor.cursor_position(), (3, 0));
+
+        let _ = editor.update(Message::MoveUp);
+        assert_eq!(editor.cursor_position(), (2, 0));
+    }
+
+    /// Typing a fence that pairs up with one further down turns everything in
+    /// between into code — and the raw region grows to take all of it, so
+    /// none of it renders as a broken half of a block.
+    #[test]
+    fn typing_a_fence_turns_what_follows_into_one_code_block() {
+        let mut editor = editor_with("intro\n\nx\nlet a = 1;\n\nlet b = 2;\n```\n\nafter", 2, 0);
+
+        type_text(&mut editor, "```");
+
+        assert_eq!(editor.lines[2], "```x");
+        assert_eq!(
+            region(&editor),
+            (2, 7),
+            "the new code block is raw as a whole"
+        );
+        assert_eq!(editor.cursor_position(), (2, 3));
+        assert_eq!(editor.block_sources, expected_block_sources(&editor));
+    }
+
+    // -- Vertical moves -----------------------------------------------------
+
+    /// A short line clamps the caret, but the column it was aiming for is
+    /// kept: on a long line again, it returns there.
+    #[test]
+    fn the_caret_keeps_its_column_across_a_short_line() {
+        let mut editor = editor_with("a long first line\nab\nanother long line", 0, 10);
+
+        let _ = editor.update(Message::MoveDown);
+        assert_eq!(editor.cursor_position(), (1, 2));
+        let _ = editor.update(Message::MoveDown);
+        assert_eq!(editor.cursor_position(), (2, 10));
+
+        // Moving sideways sets a new column to aim for.
+        act(
+            &mut editor,
+            text_editor::Action::Move(text_editor::Motion::Left),
+        );
+        let _ = editor.update(Message::MoveUp);
+        let _ = editor.update(Message::MoveUp);
+        assert_eq!(editor.cursor_position(), (0, 9));
+    }
+
+    #[test]
+    fn typing_forgets_the_column_aimed_for() {
+        let mut editor = editor_with("a long first line\nab\nanother long line", 0, 10);
+
+        let _ = editor.update(Message::MoveDown);
+        type_text(&mut editor, "c");
+        let _ = editor.update(Message::MoveDown);
+
+        assert_eq!(editor.cursor_position(), (2, 3));
+    }
+
+    // -- Incremental re-segmentation -----------------------------------------
+
+    /// Moving the caret only re-parses the blocks it leaves and enters; the
+    /// rest keep their parse — and with it their key, and their laid-out text.
+    #[test]
+    fn navigation_leaves_distant_blocks_parsed_once() {
+        let document: String = (0..200).map(|i| format!("para {i}\n\n")).collect();
+        let mut editor = editor_with(&document, 0, 0);
+        let distant = *editor.block_ids.last().unwrap();
+        let before = editor.next_block_id;
+
+        for _ in 0..20 {
+            let _ = editor.update(Message::MoveDown);
+        }
+
+        assert_eq!(*editor.block_ids.last().unwrap(), distant);
+        assert!(
+            editor.next_block_id - before <= 20,
+            "{} blocks parsed for 20 moves",
+            editor.next_block_id - before
+        );
+        assert_eq!(editor.block_sources, expected_block_sources(&editor));
+    }
+
+    /// Lines before a dirty range keep their numbers; lines after it moved by
+    /// the lines gained or lost, however many splices happened.
+    #[test]
+    fn dirty_ranges_follow_splices() {
+        let mut dirty = None;
+        Dirty::touch(&mut dirty, 10..12);
+
+        // Two lines gained before the range: it widens back to the splice,
+        // and its end moves down with the lines after it.
+        Dirty::splice(&mut dirty, 2..3, 3);
+        assert_eq!(
+            dirty,
+            Some(Dirty {
+                start: 2,
+                end: 14,
+                delta: 2
+            })
+        );
+        assert_eq!(dirty.unwrap().old_end(), 12);
+
+        // Two lines lost after it: the range reaches the splice.
+        Dirty::splice(&mut dirty, 20..22, 0);
+        assert_eq!(
+            dirty,
+            Some(Dirty {
+                start: 2,
+                end: 20,
+                delta: 0
+            })
+        );
     }
 
     // ---- randomized regression coverage ----
@@ -3481,17 +4525,55 @@ mod tests {
         // active region only slide the segments after it). It must stay
         // byte-identical to a full walk, or `view` renders the wrong lines and
         // `blocks` falls out of alignment with them.
-        let mut fresh = Vec::new();
-        collect_segments(
-            &editor.lines,
-            editor.active_start,
-            editor.active_end,
-            &mut fresh,
+        // The raw editor holds exactly the region's lines: every edit is
+        // written back line for line, so any drift corrupts the document.
+        assert!(
+            content_matches(
+                &editor.active_content,
+                &editor.lines[editor.active_start..editor.active_end]
+            ),
+            "seed {seed} step {step}: the editor holds {:?}, the region is {:?}",
+            editor.active_content.text(),
+            &editor.lines[editor.active_start..editor.active_end]
         );
+
+        let fresh = segments(&editor.lines, editor.active_start, editor.active_end);
         assert_eq!(
             editor.segments, fresh,
             "seed {seed} step {step}: cached segments diverged from a full walk"
         );
+
+        // The height tables are the sole offset↔line mapping: a length that
+        // drifts from the document's sends the window and every spacer
+        // somewhere else.
+        assert_eq!(
+            editor.line_heights.len(),
+            editor.lines.len(),
+            "seed {seed} step {step}: line heights out of step with the lines"
+        );
+        assert_eq!(
+            editor.line_offsets.len(),
+            editor.lines.len() + 1,
+            "seed {seed} step {step}: line offsets out of step with the lines"
+        );
+        assert_eq!(
+            editor.block_ids.len(),
+            editor.blocks.len(),
+            "seed {seed} step {step}: block ids out of step with the blocks"
+        );
+
+        // A code block is never split into rendered pieces: the region either
+        // covers all of one or none of it.
+        for (start, end) in fences::blocks(&editor.lines) {
+            let overlaps = editor.active_start < end && start < editor.active_end;
+            let covers = editor.active_start <= start && end <= editor.active_end;
+            assert!(
+                !overlaps || covers,
+                "seed {seed} step {step}: region {}..{} splits code block {start}..{end}",
+                editor.active_start,
+                editor.active_end
+            );
+        }
 
         // `rebuild_blocks` only splices the changed middle, so a region that
         // moves by more than a line — which every selection message can do —
@@ -3536,7 +4618,7 @@ mod tests {
         let at_doc_first = editor.active_start == 0;
         let at_doc_last = editor.active_end >= editor.lines.len();
 
-        match r % 23 {
+        match r % 28 {
             0 | 1 => {
                 let chars = ['a', ' ', '|', '-', '#', '*', '`', '>', '[', ']'];
                 let ch = chars[(r >> 8) as usize % chars.len()];
@@ -3596,7 +4678,7 @@ mod tests {
             }
             12 => {
                 let index = (r >> 8) as usize % (editor.lines.len() + 2);
-                Message::Activate(index)
+                click(index)
             }
             13 => {
                 let actions = [
@@ -3637,8 +4719,26 @@ mod tests {
             19 => Message::DragTo((r >> 8) as usize % (editor.lines.len() + 2)),
             20 => Message::DragEnd,
             21 => Message::EditorAction(Action::Edit(Edit::Paste(Arc::new(
-                ["x", "a\nb", "  spaced  ", "<p>html</p>", ""][(r >> 8) as usize % 5].to_owned(),
+                [
+                    "x",
+                    "a\nb",
+                    "  spaced  ",
+                    "<p>html</p>",
+                    "",
+                    "```\ncode\n\nmore\n```",
+                    "\n\n",
+                    "~~~",
+                    "p\r\nq\r\n",
+                ][(r >> 8) as usize % 9]
+                    .to_owned(),
             )))),
+            // Undo and redo splice lines wherever the edit being undone was,
+            // however far from the region — the hardest case for keeping the
+            // segments up to date incrementally.
+            23 | 24 => Message::Undo,
+            25 => Message::Redo,
+            // Replacing edits lines in place, anywhere in the document.
+            26 => Message::ReplaceAll,
             _ => Message::EditorAction(Action::Edit(Edit::Insert('x'))),
         }
     }
@@ -3651,16 +4751,39 @@ mod tests {
             "single line",
             "a\nb\nc\nd\ne",
             "| H |\n|---|\n| x |",
+            // Code blocks with blank lines inside, next to prose and each
+            // other: the fences decide how everything after them splits.
+            "intro\n\n```rust\nfn a() {}\n\nfn b() {}\n```\n\nmiddle\n\n~~~\n\nx\n~~~\n\nend",
+            "```\n\n```\n```\nopen fence left dangling\n\n- a\n- b\n\n> q",
+            // A Windows file.
+            "# Title\r\n\r\ntext\r\n\r\n```\r\ncode\r\n```\r\n",
         ];
 
+        // `MD_EDITOR_FUZZ=<runs>,<steps>` for a longer stress run.
+        let (runs, steps) = std::env::var("MD_EDITOR_FUZZ")
+            .ok()
+            .and_then(|value| {
+                let (runs, steps) = value.split_once(',')?;
+                Some((runs.parse().ok()?, steps.parse().ok()?))
+            })
+            .unwrap_or((120u64, 50usize));
+
         for (s, doc) in seeds.iter().enumerate() {
-            for seed in 0..120u64 {
+            for seed in 0..runs {
                 let (mut editor, _t) = MarkdownEditor::new_with_file(None);
                 editor.load_document(doc);
                 editor.rebuild();
                 let mut state = seed.wrapping_mul(0x9E3779B97F4A7C15).wrapping_add(1);
 
-                for step in 0..50usize {
+                // A third of the runs replace as they go: deleting every "a"
+                // can blank a line out anywhere in the document.
+                if seed % 3 == 0 {
+                    let _ = editor.update(Message::OpenSearch { replace: true });
+                    let _ = editor.update(Message::SearchQueryChanged("a".to_owned()));
+                    check_invariants(&editor, seed + (s as u64) * 1000, 0);
+                }
+
+                for step in 0..steps {
                     let r = next_rand(&mut state);
                     let msg = simulated_message(&editor, r);
                     let _ = editor.update(msg);
@@ -3764,7 +4887,7 @@ mod tests {
         editor.load_document("first\nsecond");
         editor.rebuild();
 
-        let _ = editor.update(Message::Activate(1));
+        let _ = editor.update(click(1));
         let _ = editor.update(Message::MergeWithPrevious);
         assert_eq!(editor.lines, vec!["firstsecond".to_owned()]);
 
@@ -3780,7 +4903,7 @@ mod tests {
 
         type_text(&mut editor, "x");
         // A click on the next line: a separate place, so a separate undo step.
-        let _ = editor.update(Message::Activate(1));
+        let _ = editor.update(click(1));
         type_text(&mut editor, "y");
         assert_eq!(editor.lines, vec!["xaa".to_owned(), "ybb".to_owned()]);
 
@@ -3829,7 +4952,7 @@ mod tests {
         editor.load_document("| A |\n|---|\n| 1 |\n\ntail");
         editor.rebuild();
 
-        let _ = editor.update(Message::Activate(2));
+        let _ = editor.update(click(2));
         let before = editor.lines.clone();
         let _ = editor.update(Message::EditorAction(text_editor::Action::Edit(
             text_editor::Edit::Enter,
@@ -4515,7 +5638,7 @@ mod tests {
     fn dragging_down_across_lines_selects_them() {
         let mut editor = editor_with("one\ntwo\nthree\nfour", 0, 0);
 
-        let _ = editor.update(Message::Activate(1));
+        let _ = editor.update(click(1));
         assert_eq!(editor.drag, Some(Drag { anchor: (1, 0) }));
 
         let _ = editor.update(Message::DragTo(3));
@@ -4534,7 +5657,7 @@ mod tests {
     fn dragging_up_across_lines_selects_backwards() {
         let mut editor = editor_with("one\ntwo\nthree\nfour", 0, 0);
 
-        let _ = editor.update(Message::Activate(3));
+        let _ = editor.update(click(3));
         let _ = editor.update(Message::DragTo(1));
 
         assert_eq!(region(&editor), (1, 4));
@@ -4547,7 +5670,7 @@ mod tests {
     fn a_drag_that_turns_around_follows_the_pointer() {
         let mut editor = editor_with("one\ntwo\nthree\nfour", 0, 0);
 
-        let _ = editor.update(Message::Activate(0));
+        let _ = editor.update(click(0));
         let _ = editor.update(Message::DragTo(3));
         let _ = editor.update(Message::DragTo(1));
 
@@ -4560,7 +5683,7 @@ mod tests {
     fn a_click_without_a_drag_selects_nothing() {
         let mut editor = editor_with("one\ntwo\nthree", 0, 0);
 
-        let _ = editor.update(Message::Activate(2));
+        let _ = editor.update(click(2));
         let _ = editor.update(Message::DragEnd);
 
         assert!(!editor.has_selection());
@@ -4590,7 +5713,7 @@ mod tests {
     fn dragging_past_the_end_of_the_document_is_ignored() {
         let mut editor = editor_with("one\ntwo", 0, 0);
 
-        let _ = editor.update(Message::Activate(0));
+        let _ = editor.update(click(0));
         let _ = editor.update(Message::DragTo(99));
 
         assert_eq!(region(&editor), (0, 1));
@@ -4703,7 +5826,7 @@ mod tests {
     fn a_drag_back_to_its_anchor_keeps_the_region_open() {
         let mut editor = editor_with("one\ntwo\nthree", 0, 0);
 
-        let _ = editor.update(Message::Activate(0));
+        let _ = editor.update(click(0));
         let _ = editor.update(Message::DragTo(2));
         assert_eq!(region(&editor), (0, 3));
 
@@ -4759,7 +5882,7 @@ mod tests {
         let mut editor = editor_with("one\ntwo", 0, 0);
         assert!(editor.drag.is_none());
 
-        let _ = editor.update(Message::Activate(1));
+        let _ = editor.update(click(1));
         assert!(editor.drag.is_some());
 
         let _ = editor.update(Message::DragEnd);
@@ -4903,6 +6026,34 @@ mod tests {
         assert_eq!(editor.lines, before);
     }
 
+    /// The raw editor shows a replacement made on its own line, so the next
+    /// key press edits the new text rather than writing the old one back —
+    /// also once the last match is gone, and nothing is left to reveal.
+    #[test]
+    fn typing_after_a_replacement_keeps_it() {
+        for replace_all in [false, true] {
+            let mut editor = editor_with("one cat\nother", 1, 0);
+            open_search(&mut editor, "cat", true);
+            let _ = editor.update(Message::ReplacementChanged("dog".to_owned()));
+
+            let _ = editor.update(if replace_all {
+                Message::ReplaceAll
+            } else {
+                Message::ReplaceCurrent
+            });
+            let _ = editor.update(Message::EditorAction(text_editor::Action::Move(
+                text_editor::Motion::End,
+            )));
+            type_text(&mut editor, "!");
+
+            assert_eq!(
+                editor.lines,
+                ["one dog!", "other"],
+                "replace all: {replace_all}"
+            );
+        }
+    }
+
     #[test]
     fn replace_can_blank_a_line_and_the_blocks_stay_consistent() {
         let (mut editor, _t) = MarkdownEditor::new_with_file(None);
@@ -4931,7 +6082,7 @@ mod tests {
         assert_eq!(editor.search.as_ref().unwrap().count(), 2);
 
         // Delete the whole second line through the normal editing path.
-        let _ = editor.update(Message::Activate(2));
+        let _ = editor.update(click(2));
         let _ = editor.update(Message::EditorAction(text_editor::Action::SelectAll));
         let _ = editor.update(Message::EditorAction(text_editor::Action::Edit(
             text_editor::Edit::Backspace,
@@ -5076,7 +6227,7 @@ mod tests {
         let (mut editor, _t) = MarkdownEditor::new_with_file(None);
         editor.load_document("# Title\n\nbody");
         editor.rebuild();
-        let before = editor.block_sources.clone();
+        let before = editor.block_ids.clone();
 
         // Color messages are pure render-time changes; they must not rebuild.
         let _ = editor.update(Message::ColorPicked(
@@ -5091,7 +6242,7 @@ mod tests {
         let _ = editor.update(Message::ResetAllColors);
         let _ = editor.update(Message::ToggleColorPanel);
 
-        assert_eq!(editor.block_sources, before);
+        assert_eq!(editor.block_ids, before);
     }
 
     #[test]
@@ -5278,12 +6429,15 @@ mod tests {
 
     /// Preferences restyle and re-measure, but the Markdown is unchanged: a
     /// rebuild here would re-parse the whole document on every click.
+    ///
+    /// Block ids are handed out afresh by every parse, so unchanged ids prove
+    /// that nothing was re-parsed — not merely re-parsed into the same text.
     #[test]
     fn settings_changes_do_not_trigger_block_rebuild() {
         let (mut editor, _t) = MarkdownEditor::new_with_file(None);
         editor.load_document("# Title\n\nbody");
         editor.rebuild();
-        let before = editor.block_sources.clone();
+        let before = editor.block_ids.clone();
 
         for message in [
             Message::ToggleSettingsPanel,
@@ -5296,14 +6450,12 @@ mod tests {
             Message::ResetSettings,
             Message::Dismiss,
         ] {
-            assert!(
-                !message_affects_blocks(&message),
-                "{message:?} must not force a block rebuild"
+            let _ = editor.update(message.clone());
+            assert_eq!(
+                editor.block_ids, before,
+                "{message:?} must not re-parse the document"
             );
-            let _ = editor.update(message);
         }
-
-        assert_eq!(editor.block_sources, before);
     }
 
     #[test]

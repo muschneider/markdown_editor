@@ -1954,8 +1954,13 @@ version = "0.1.0"
 dependencies = [
  "iced",
  "iced_highlighter",
+ "iced_renderer",
+ "iced_runtime",
+ "iced_tiny_skia",
+ "pulldown-cmark",
  "rfd",
  "tokio",
+ "two-face",
  "webbrowser",
 ]
 

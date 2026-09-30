@@ -10,8 +10,9 @@ This project was implemented using **vibe coding** — an AI-assisted developmen
 
 - **Inline rendering**: the document is shown rendered; only the line under the
   cursor falls back to raw Markdown source, so there is no separate preview pane
-- **Whole-table editing**: entering a table makes the entire table editable at
-  once, so rows never fall apart mid-edit
+- **Whole-table and whole-code-block editing**: entering a table or a fenced
+  code block makes all of it editable at once, so rows and code never fall
+  apart mid-edit; code is highlighted in its own language as you type
 - **Document-wide selection**: select across lines with the keyboard or by
   dragging, then copy, cut, paste or delete it like in any text editor —
   including `Ctrl+A` over the whole file
@@ -20,7 +21,10 @@ This project was implemented using **vibe coding** — an AI-assisted developmen
 - **Find and replace**: `Ctrl+F` / `Ctrl+H`, with a match counter, case
   toggle, and single or whole-document replacement
 - **Windowed rendering**: only the segments near the viewport are built into the
-  widget tree, so large documents stay responsive
+  widget tree, and only the ones that changed are parsed or laid out again, so
+  large documents stay responsive
+- **Steady scrolling**: the text never jumps while you scroll, and the caret
+  stays in view as you move, type, page or search
 - **File Operations**: Open and save Markdown files via native file dialogs
 - **Formatting Toolbar**: Quick access to common Markdown formatting options
 - **Settings panel** (`Ctrl+,`): theme, font size, text width, toolbar and
@@ -48,6 +52,7 @@ where the platform modifier is `Option`.
 | `Ctrl+B` / `Ctrl+I`       | Bold / italic              |
 | `Ctrl+←` / `Ctrl+→`       | Move by word               |
 | `Home` / `End`            | Start / end of line        |
+| `↑` / `↓`                 | Previous / next row, keeping the column |
 | `PgUp` / `PgDn`           | Move a page                |
 | `Ctrl+Home` / `Ctrl+End`  | Start / end of document    |
 
@@ -66,9 +71,14 @@ where the platform modifier is `Option`.
 | `Backspace` / `Delete`          | Delete the selection, or one character  |
 | `Ctrl+Backspace` / `Ctrl+Delete` | Delete the previous / next word        |
 
-Clicking a rendered block moves the cursor into it; dragging from it selects
-across lines, and double- or triple-clicking selects a word or a line. Pasting
-text that is HTML markup converts it to Markdown first.
+Clicking rendered text puts the cursor on the character you clicked, in the
+Markdown source — past the `**` of bold text or the `#` of a heading, on the
+right line of a wrapped paragraph. Dragging from it selects across lines, and
+double- or triple-clicking selects a word or a line. Pasting text that is HTML
+markup converts it to Markdown first.
+
+`↑` and `↓` step through the rows of a wrapped line before leaving it, and
+return to the column you started from after passing a shorter line.
 
 ## Screenshots
 
@@ -209,7 +219,17 @@ cargo test
 
 # Run tests with output
 cargo test -- --nocapture
+
+# Frame-cost benchmarks (whole frames: update, view, layout, draw)
+cargo test --release -- --ignored --nocapture
+MD_EDITOR_PHASES=1 cargo test --release measure_frame_costs -- --ignored --nocapture
+
+# A longer run of the randomized editing test
+MD_EDITOR_FUZZ=1500,300 cargo test --release fuzz_editing_never_breaks_invariants
 ```
+
+Debug builds optimize dependencies (see `Cargo.toml`), so `cargo run` stays
+usable; the first debug build takes longer because of it.
 
 ## Project Structure
 
@@ -217,17 +237,24 @@ cargo test -- --nocapture
 src/
   main.rs          # Application entry point
   app.rs           # Core state, messages, update/view logic
+  app/headless.rs  # Tests and benchmarks that run the real UI without a window
   color_picker.rs  # Per-tag color customization widget
   config.rs        # Persist settings + colors to $XDG_CONFIG_HOME
+  document.rs      # Document widgets: keyed column, anchored viewport, line hits
+  fences.rs        # Fenced code blocks: finding and tracking them
   file_ops.rs      # Async file I/O operations
+  highlighter.rs   # Syntax highlighting of the line being edited
   history.rs       # Undo/redo, recorded as line-range replacements
   html.rs          # HTML -> Markdown conversion for pasted rich text
   icons.rs         # SVG icons for the toolbar
   markdown_view.rs # Theme-aware Markdown rendering + code highlighting
   search.rs        # Find / find-and-replace state and bar
   settings.rs      # User preferences and the settings panel
+  source_map.rs    # Maps clicks on rendered text back to the Markdown source
+  syntax.rs        # Syntax highlighting, memoized line by line
   theme.rs         # Theme styles and per-tag Markdown colors
   toolbar.rs       # Formatting toolbar
+  wrap.rs          # Where the editor wraps lines, for moving the caret
 
 assets/
   md_editor.svg    # Application icon (scalable, installed to hicolor)
@@ -243,7 +270,8 @@ Makefile            # build / install / uninstall / dist
 ## Technologies
 
 - [Iced 0.14](https://github.com/iced-rs/iced) - Cross-platform GUI framework
-- [pulldown-cmark](https://github.com/pulldown-cmark/pulldown-cmark) - Markdown parser (via Iced)
+- [pulldown-cmark](https://github.com/pulldown-cmark/pulldown-cmark) - Markdown parser (via Iced, and directly to map clicks to the source)
+- [syntect](https://github.com/trishume/syntect) / [two-face](https://github.com/CosmicHorrorDev/two-face) - Syntax highlighting
 - [rfd](https://github.com/PolyMeilex/rfd) - Native file dialogs
 - [Tokio](https://tokio.rs/) - Async runtime
 

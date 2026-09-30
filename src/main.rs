@@ -4,15 +4,21 @@
 mod app;
 mod color_picker;
 mod config;
+mod document;
+mod fences;
 mod file_ops;
+mod highlighter;
 mod history;
 mod html;
 mod icons;
 mod markdown_view;
 mod search;
 mod settings;
+mod source_map;
+mod syntax;
 mod theme;
 mod toolbar;
+mod wrap;
 
 use std::path::PathBuf;
 

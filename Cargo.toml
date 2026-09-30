@@ -14,17 +14,43 @@ short_description = "A simple Markdown editor with inline rendering, built with 
 # icon = ["assets/icon.icns"]  # optional; add an .icns for a Dock/Finder icon
 
 [dependencies]
-iced = { version = "0.14", features = ["markdown", "svg", "tokio"] }
-# Used directly for our own (theme-correct, cached, windowed) syntax highlighting
-# of code blocks and the active editor line. Depending on it directly — instead
-# of via iced's `highlighter` feature — keeps iced's `markdown` parser from
-# eagerly syntax-highlighting every code block during parsing (with a hardcoded
-# theme we discard and re-highlight anyway), which made opening large documents
+iced = { version = "0.14", features = ["advanced", "markdown", "svg", "tokio"] }
+# The syntax-highlighting themes (`syntax::Theme`); the highlighting itself is
+# done by `syntax.rs`. Depending on it directly — instead of via iced's
+# `highlighter` feature — keeps iced's `markdown` parser from eagerly
+# syntax-highlighting every code block during parsing (with a hardcoded theme
+# we discard and re-highlight anyway), which made opening large documents
 # block for hundreds of milliseconds.
 iced_highlighter = "0.14"
+# The Markdown parser iced renders with, used directly to map rendered text
+# back to its source. Must stay on iced's version, so both parse alike (and
+# the crate is only built once).
+pulldown-cmark = { version = "0.12", default-features = false }
 rfd = { version = "0.17", default-features = false, features = ["gtk3"] }
 tokio = { version = "1", features = ["fs"] }
+# syntect and its syntax definitions, as iced_highlighter uses them — used
+# directly so highlighting can be memoized line by line (see `syntax.rs`).
+# Same version and features as iced_highlighter's, so nothing is built twice.
+two-face = { version = "0.4", default-features = false, features = ["syntect-default-fancy"] }
 webbrowser = "1"
+
+# Test-only: drive the real iced pipeline (view -> diff -> layout -> draw)
+# headlessly with the software renderer, so tests can measure and assert on
+# what the runtime actually does after `view` returns. All three are already
+# in the dependency graph through `iced`; listing them adds no new crates.
+[dev-dependencies]
+iced_renderer = "0.14"
+iced_runtime = "0.14"
+iced_tiny_skia = "0.14"
+
+# Almost all of the per-frame work — layout, text shaping, syntax highlighting,
+# Markdown parsing — runs inside dependencies. Unoptimized, they made debug
+# builds (`cargo run`, `make run`, `cargo test`) 10–15× slower than release:
+# ~100 ms per scroll event. Optimizing only the dependencies keeps rebuilds of
+# this crate fast while making debug builds usable; it costs one slower,
+# cached, first build of the dependency tree.
+[profile.dev.package."*"]
+opt-level = 3
 
 [profile.release]
 lto = true
