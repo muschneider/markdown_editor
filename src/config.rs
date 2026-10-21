@@ -29,7 +29,7 @@
 use std::fs;
 use std::path::PathBuf;
 
-use crate::settings::{FontSize, Settings, WrapWidth};
+use crate::settings::{FontSize, Mode, Settings, WrapWidth};
 use crate::theme::MarkdownColors;
 
 /// Header comment written at the top of every config file.
@@ -231,6 +231,7 @@ fn strip_quotes(value: &str) -> &str {
 fn setting_entries(settings: &Settings) -> Vec<(&'static str, String)> {
     vec![
         ("theme", settings.theme.to_string()),
+        ("mode", settings.mode.as_config().to_string()),
         ("show_toolbar", settings.show_toolbar.to_string()),
         ("show_status_bar", settings.show_status_bar.to_string()),
         ("font_size", settings.font_size.0.to_string()),
@@ -255,6 +256,7 @@ fn setting_entries(settings: &Settings) -> Vec<(&'static str, String)> {
 fn assign_setting(settings: &mut Settings, key: &str, value: &str) -> bool {
     match key {
         "theme" => settings.theme = Settings::theme_from_name(value),
+        "mode" => settings.mode = Mode::from_config(value),
         "show_toolbar" => settings.show_toolbar = parse_bool(value, true),
         "show_status_bar" => settings.show_status_bar = parse_bool(value, true),
         "font_size" => settings.font_size = FontSize::from_config(value),
@@ -390,6 +392,7 @@ mod tests {
         let original = Config {
             settings: Settings {
                 theme: Theme::Dracula,
+                mode: Mode::Visual,
                 show_toolbar: false,
                 show_status_bar: false,
                 font_size: FontSize(20),
@@ -413,6 +416,7 @@ mod tests {
         let defaults = Settings::default();
         let changed = Settings {
             theme: Theme::GruvboxLight,
+            mode: defaults.mode.toggled(),
             show_toolbar: !defaults.show_toolbar,
             show_status_bar: !defaults.show_status_bar,
             font_size: FontSize(28),
@@ -524,6 +528,7 @@ table_header_text: \"#ffffff\"
     fn out_of_range_settings_fall_back_per_field() {
         let config = parse(
             "theme: \"Not A Theme\"\n\
+             mode: \"reading\"\n\
              font_size: \"9999\"\n\
              wrap_width: \"nonsense\"\n\
              show_toolbar: \"maybe\"\n\
@@ -531,6 +536,7 @@ table_header_text: \"#ffffff\"
         );
 
         assert_eq!(config.settings.theme, DEFAULT_THEME);
+        assert_eq!(config.settings.mode, Mode::Editor);
         assert_eq!(config.settings.font_size, FontSize::DEFAULT);
         assert_eq!(config.settings.wrap_width, WrapWidth::FULL);
         // Unparseable booleans keep the field's own default…

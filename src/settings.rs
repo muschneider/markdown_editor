@@ -131,11 +131,64 @@ impl fmt::Display for WrapWidth {
     }
 }
 
+/// Whether the document is being read or edited.
+///
+/// The editor normally renders every line as Markdown except the active
+/// region, which is a raw `text_editor` (see [`crate::app`]).
+/// [`Mode::Visual`] drops that region entirely: the cursor's line renders
+/// like every other line, and the document becomes a pure reading view.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Mode {
+    /// The cursor's line shows raw Markdown source and is editable.
+    #[default]
+    Editor,
+    /// Every line renders as Markdown; the document cannot be edited.
+    Visual,
+}
+
+impl Mode {
+    /// Whether the cursor's line is shown as raw, editable source.
+    ///
+    /// Asked rather than `is_visual` throughout: every caller is deciding
+    /// whether some piece of editing machinery applies at all.
+    pub fn is_editor(self) -> bool {
+        matches!(self, Mode::Editor)
+    }
+
+    /// The other mode.
+    pub fn toggled(self) -> Self {
+        match self {
+            Mode::Editor => Mode::Visual,
+            Mode::Visual => Mode::Editor,
+        }
+    }
+
+    /// The name written to the config file.
+    pub fn as_config(self) -> &'static str {
+        match self {
+            Mode::Editor => "editor",
+            Mode::Visual => "visual",
+        }
+    }
+
+    /// Parse a mode from config text, falling back to [`Mode::Editor`] for
+    /// anything unrecognised.
+    pub fn from_config(value: &str) -> Self {
+        match value {
+            "visual" => Mode::Visual,
+            _ => Mode::Editor,
+        }
+    }
+}
+
 /// Every user preference except the per-tag Markdown colors.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Settings {
     /// The application theme used to render the Markdown preview.
     pub theme: Theme,
+    /// Whether the cursor's line is editable raw source, or rendered like the
+    /// rest of the document.
+    pub mode: Mode,
     /// Whether the top toolbar is shown.
     pub show_toolbar: bool,
     /// Whether the bottom status bar is shown.
@@ -157,6 +210,9 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             theme: DEFAULT_THEME,
+            // Editing is what the editor is for; the reading view is a
+            // deliberate switch away from it.
+            mode: Mode::Editor,
             show_toolbar: true,
             show_status_bar: true,
             font_size: FontSize::DEFAULT,

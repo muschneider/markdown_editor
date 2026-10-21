@@ -49,7 +49,12 @@ impl FormatAction {
 
 /// Build the formatting toolbar: icon buttons grouped by purpose and divided by
 /// thin separators (inline marks, headings, lists, blocks).
-pub fn view<'a>() -> Element<'a, Message> {
+///
+/// Every button is greyed out when `enabled` is false — visual mode, where
+/// there is no raw line to insert the markup into.
+pub fn view<'a>(enabled: bool) -> Element<'a, Message> {
+    let format_button = move |icon, tip, action| format_button(icon, tip, action, enabled);
+
     row![
         format_button(icons::bold(), "Bold", FormatAction::Bold),
         format_button(icons::italic(), "Italic", FormatAction::Italic),
@@ -82,8 +87,13 @@ pub fn view<'a>() -> Element<'a, Message> {
 }
 
 /// Create a formatting button that emits a [`Message::Format`].
-fn format_button<'a>(icon: Handle, tip: &'a str, action: FormatAction) -> Element<'a, Message> {
-    icon_button(icon, tip, Message::Format(action))
+fn format_button<'a>(
+    icon: Handle,
+    tip: &'a str,
+    action: FormatAction,
+    enabled: bool,
+) -> Element<'a, Message> {
+    icon_button_maybe(icon, tip, enabled.then_some(Message::Format(action)))
 }
 
 /// Build an icon-only toolbar button with a tooltip describing its action.

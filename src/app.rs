@@ -17,6 +17,14 @@
 //! invalid, un-renderable fragment. So the raw region is a **range of lines**
 //! (`active_start..active_end`), not a single line: normally it covers one line,
 //! but when the cursor enters a table it expands to cover the whole table.
+//!
+//! All of the above is [`settings::Mode::Editor`]. In
+//! [`settings::Mode::Visual`] there is **no raw region at all**: the cursor's
+//! line is grouped with its neighbours like any other, the whole document
+//! renders, and no `text_editor` is put in the tree. Everything that follows
+//! from having a region — placing a caret, drawing a selection, editing —
+//! therefore belongs to editor mode alone, and [`MarkdownEditor::active_region`]
+//! is the one place that says which mode we are in.
 
 use std::cell::RefCell;
 use std::ops::Range;
@@ -60,6 +68,7 @@ Just start typing. Click anywhere to move the cursor there.
 | Keys                | Action                        |
 |---------------------|-------------------------------|
 | `Ctrl+N O S`        | new / open / save             |
+| `Ctrl+E`            | visual / editor mode          |
 | `Ctrl+Z`  `Ctrl+Y`  | undo / redo                   |
 | `Ctrl+B`  `Ctrl+I`  | bold / italic                 |
 | `Ctrl+←/→`          | move by word                  |
@@ -217,8 +226,9 @@ pub struct MarkdownEditor {
     /// were last brought up to date, or `None` when they are current.
     dirty: Option<Dirty>,
     /// The active range the cached segments were built with: what their
-    /// [`Segment::Active`] stands for.
-    synced_region: (usize, usize),
+    /// [`Segment::Active`] stands for, or `None` when they were built in
+    /// visual mode and hold no [`Segment::Active`] at all.
+    synced_region: Option<(usize, usize)>,
     /// Incremented whenever the text of the document changes.
     revision: u64,
     /// Height (px) each line contributes to the laid-out document: its share
@@ -415,6 +425,11 @@ pub enum Message {
     Format(FormatAction),
     /// Change the theme used to render the Markdown preview.
     ThemeChanged(Theme),
+    /// Switch between editor mode (the cursor's line is raw source) and visual
+    /// mode (the whole document renders).
+    ToggleMode,
+    /// Scroll the document in visual mode, where no widget holds the keyboard.
+    ScrollDocument(ScrollStep),
     /// Toggle the settings panel open/closed.
     ToggleSettingsPanel,
     /// `Esc`: close the innermost open panel, whichever that is.
@@ -478,6 +493,27 @@ pub enum Message {
     DragTo(usize),
     /// The mouse button was released, ending any selection drag.
     DragEnd,
+}
+
+/// How far [`Message::ScrollDocument`] moves the visual-mode view.
+///
+/// Visual mode has no caret to navigate by and no focused widget to receive
+/// keys, so the arrow and page keys move the *viewport* instead — the only
+/// thing there is to move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrollStep {
+    /// One line towards the start of the document.
+    LineUp,
+    /// One line towards the end of the document.
+    LineDown,
+    /// One screen towards the start of the document.
+    PageUp,
+    /// One screen towards the end of the document.
+    PageDown,
+    /// The top of the document.
+    Start,
+    /// The bottom of the document.
+    End,
 }
 
 /// Theme the editor starts with.
@@ -660,7 +696,8 @@ impl MarkdownEditor {
             fences_dirty: true,
             structure_changed: false,
             dirty: None,
-            synced_region: (0, 1),
+            // Set for real by the `rebuild` below, once `settings` is in place.
+            synced_region: None,
             revision: 0,
             line_heights: Vec::new(),
             line_offsets: Vec::new(),
@@ -700,7 +737,8 @@ impl MarkdownEditor {
             );
         }
 
-        (editor, iced::widget::operation::focus(ACTIVE_LINE_ID))
+        let focus = editor.focus_active();
+        (editor, focus)
     }
 
     /// Persist the current configuration (preferences and colors).
@@ -852,7 +890,10 @@ impl MarkdownEditor {
                 Task::none()
             }
             Message::ClickAt(press) => {
-                if press.line >= self.lines.len() {
+                // Visual mode wraps no segment in a `document::Hit`, so this
+                // cannot arrive while it is on — but a caret placed from a
+                // reading view would be a caret nobody asked for.
+                if !self.is_editing() || press.line >= self.lines.len() {
                     return self.focus_active();
                 }
 
@@ -1093,6 +1134,12 @@ impl MarkdownEditor {
                 Task::none()
             }
             Message::Format(action) => {
+                // The toolbar greys these out in visual mode; there is no raw
+                // line to insert the markup into.
+                if !self.is_editing() {
+                    return Task::none();
+                }
+
                 // Insert the formatted text into the active line by performing
                 // edit actions; any existing selection is replaced by typing.
                 let selection = self.active_content.selection().unwrap_or_default();
@@ -1115,6 +1162,29 @@ impl MarkdownEditor {
                 self.save_config();
                 Task::none()
             }
+            Message::ToggleMode => {
+                self.settings.mode = self.settings.mode.toggled();
+
+                // The search bar replaces text through the raw region, which
+                // visual mode does not have.
+                if !self.is_editing() {
+                    self.search = None;
+                }
+
+                // Adding or removing the raw region re-splits the block around
+                // the cursor, so the cached segments cannot be slid into
+                // agreement — they are walked again from the start. A mode
+                // switch is a deliberate, occasional act; `sync` then has
+                // nothing left to do.
+                self.rebuild();
+
+                // Coming back to editing, the caret has not moved but has been
+                // off screen all the while.
+                self.request_reveal(RevealMode::Center);
+                self.save_config();
+                self.focus_active()
+            }
+            Message::ScrollDocument(step) => self.scroll_document(step),
             Message::ToggleSettingsPanel => {
                 self.show_settings_panel = !self.show_settings_panel;
                 // The color panel is opened *from* the settings panel, so it
@@ -1294,6 +1364,12 @@ impl MarkdownEditor {
     /// Build the UI: toolbar on top, the inline-rendered document, status bar.
     pub fn view(&self) -> Element<'_, Message> {
         // -- Toolbar --
+        //
+        // Visual mode is a reading view: everything that would edit the
+        // document acts on a caret that is not drawn and a line that is not
+        // raw, so those controls are greyed out until editing resumes.
+        let editing = self.is_editing();
+
         let file_controls = row![
             toolbar::icon_button(icons::new_file(), "New (Ctrl+N)", Message::NewFile),
             toolbar::icon_button(icons::open_file(), "Open (Ctrl+O)", Message::OpenFile),
@@ -1302,22 +1378,39 @@ impl MarkdownEditor {
             toolbar::icon_button_maybe(
                 icons::undo(),
                 "Undo (Ctrl+Z)",
-                self.history.can_undo().then_some(Message::Undo),
+                (editing && self.history.can_undo()).then_some(Message::Undo),
             ),
             toolbar::icon_button_maybe(
                 icons::redo(),
                 "Redo (Ctrl+Y)",
-                self.history.can_redo().then_some(Message::Redo),
+                (editing && self.history.can_redo()).then_some(Message::Redo),
             ),
         ]
         .spacing(4)
         .align_y(iced::Center);
 
-        let format_bar = toolbar::view();
+        let format_bar = toolbar::view(editing);
+
+        // Shows the mode it switches *to*, like every other toggle button.
+        let mode_toggle = if editing {
+            toolbar::icon_button(
+                icons::eye(),
+                "Visual mode — render every line (Ctrl+E)",
+                Message::ToggleMode,
+            )
+        } else {
+            toolbar::icon_button(
+                icons::pencil(),
+                "Editor mode — edit the cursor's line (Ctrl+E)",
+                Message::ToggleMode,
+            )
+        };
 
         // Theme selector and settings toggle, pushed to the right edge of the
         // toolbar.
         let theme_picker = row![
+            mode_toggle,
+            toolbar::separator(),
             text("Theme").size(13).style(app_theme::status_text),
             pick_list(
                 Theme::ALL,
@@ -1474,9 +1567,10 @@ impl MarkdownEditor {
 
         // Only the segments in the window are visited — found by binary
         // search, so building the view costs the same wherever in however
-        // long a document it is — plus the editor, which always renders for
-        // real: it holds the keyboard focus and the caret.
-        let active = (self.active_start, self.active_end);
+        // long a document it is — plus, in editor mode, the editor, which
+        // always renders for real: it holds the keyboard focus and the caret.
+        let region = self.active_region();
+        let active = region.unwrap_or_default();
         let bounds = |segment: &Segment| segment.lines(active);
         let (first, last) = match window {
             Some((top, bottom)) => (
@@ -1485,15 +1579,14 @@ impl MarkdownEditor {
             ),
             None => (0, self.segments.len()),
         };
-        let editor = self
-            .segments
-            .partition_point(|s| bounds(s).1 <= self.active_start);
-        let visited = if editor < first {
-            [editor..editor + 1, first..last]
-        } else if editor >= last {
-            [first..last, editor..editor + 1]
-        } else {
-            [first..last, 0..0]
+        // Visual mode has no editor to keep in the tree, so the window is all
+        // there is to visit.
+        let editor =
+            region.map(|(start, _)| self.segments.partition_point(|s| bounds(s).1 <= start));
+        let visited = match editor {
+            Some(editor) if editor < first => [editor..editor + 1, first..last],
+            Some(editor) if editor >= last => [first..last, editor..editor + 1],
+            _ => [first..last, 0..0],
         };
 
         // `blocks` holds one entry per Block segment, rendered or not.
@@ -1626,14 +1719,21 @@ impl MarkdownEditor {
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| String::from("Untitled"));
 
-        let active_row = self.active_start + cursor.position.line;
-        let char_column = self
-            .lines
-            .get(active_row)
-            .and_then(|line| line.get(..cursor.position.column))
-            .map(|prefix| prefix.chars().count())
-            .unwrap_or(0);
-        let position = format!("Ln {}, Col {}", active_row + 1, char_column + 1);
+        // Visual mode draws no caret, so a line and column would point at
+        // something invisible; it reports the mode instead.
+        let position = if editing {
+            let active_row = self.active_start + cursor.position.line;
+            let char_column = self
+                .lines
+                .get(active_row)
+                .and_then(|line| line.get(..cursor.position.column))
+                .map(|prefix| prefix.chars().count())
+                .unwrap_or(0);
+
+            format!("Ln {}, Col {}", active_row + 1, char_column + 1)
+        } else {
+            String::from("Visual")
+        };
 
         let status_bar: Option<Element<'_, Message>> = self.settings.show_status_bar.then(|| {
             container(
@@ -1691,6 +1791,24 @@ impl MarkdownEditor {
         self.settings.theme.clone()
     }
 
+    /// The line range shown as raw, editable source — `None` in visual mode,
+    /// where the whole document renders.
+    ///
+    /// The single source of truth for "is any line raw": the segment walk, the
+    /// view and [`MarkdownEditor::sync`] all ask here rather than reading
+    /// [`Settings::mode`] themselves, so they cannot disagree about it.
+    fn active_region(&self) -> Option<(usize, usize)> {
+        self.settings
+            .mode
+            .is_editor()
+            .then_some((self.active_start, self.active_end))
+    }
+
+    /// Whether the cursor's line is shown as raw source and can be edited.
+    fn is_editing(&self) -> bool {
+        self.settings.mode.is_editor()
+    }
+
     /// Layout estimates for the current font size and text width — and the
     /// document's real width, once it has been laid out.
     fn metrics(&self) -> Metrics {
@@ -1709,16 +1827,19 @@ impl MarkdownEditor {
 
     /// Events that cannot go through the focused widget.
     ///
-    /// Both listeners below are installed only while something actually needs
-    /// them, so ordinary editing never pays for one.
+    /// Every listener below is installed only while something actually needs
+    /// one, so ordinary editing never pays for any of them.
     pub fn subscription(&self) -> Subscription<Message> {
         let panels = self.needs_key_listener().then(panel_keys);
+        // Visual mode puts no editor in the tree, so nothing holds the
+        // keyboard: the keys it does answer to have to be listened for.
+        let visual = (!self.is_editing()).then(visual_keys);
         // The button can be released anywhere — over another widget, or outside
         // the window entirely — and no widget would report that, so the end of
         // a drag has to be watched for globally.
         let drag = self.drag.is_some().then(mouse_release);
 
-        Subscription::batch(panels.into_iter().chain(drag))
+        Subscription::batch(panels.into_iter().chain(visual).chain(drag))
     }
 
     /// Replace the whole document with `text`, resetting the active region.
@@ -1761,7 +1882,7 @@ impl MarkdownEditor {
         self.rebuild_blocks();
         self.dirty = None;
         self.structure_changed = false;
-        self.synced_region = (self.active_start, self.active_end);
+        self.synced_region = self.active_region();
         self.refresh_offsets();
     }
 
@@ -1777,50 +1898,59 @@ impl MarkdownEditor {
     /// range, stops at the first one after it, and the segments in between
     /// are replaced; the ones after only move by the lines gained or lost.
     fn sync(&mut self) {
-        let region = (self.active_start, self.active_end);
+        let region = self.active_region();
         if self.dirty.is_none() && region == self.synced_region {
             return;
         }
-        if self.fences_dirty || self.segments.is_empty() {
+        // Switching between editor and visual mode adds or removes the raw
+        // region, and with it the block boundaries the region split: there is
+        // no incremental path from one mode's segments to the other's.
+        if self.fences_dirty
+            || self.segments.is_empty()
+            || region.is_some() != self.synced_region.is_some()
+        {
             return self.rebuild();
         }
 
-        let old_region = self.synced_region;
+        // In visual mode no segment carries the region, so any range does.
+        let old_region = self.synced_region.unwrap_or_default();
         let bounds = |segment: &Segment| segment.lines(old_region);
+
+        let mut dirty = self.dirty.take().unwrap_or(Dirty {
+            start: old_region.0,
+            end: old_region.1,
+            delta: 0,
+        });
 
         // Both the region the segments were built for and the current one
         // render differently from the lines around them, so both are walked
         // again. The old one is in the old numbering: lines before the dirty
-        // range kept their index, lines after it moved by `delta`.
-        let mut dirty = self.dirty.take().unwrap_or(Dirty {
-            start: region.0,
-            end: region.1,
-            delta: 0,
-        });
-        let old_end = dirty.old_end();
-        // A position inside the dirty range has no single new number; the
-        // range's own edge is always a safe (wider) choice.
-        let renumbered_start = if old_region.0 < dirty.start {
-            old_region.0
-        } else if old_region.0 >= old_end {
-            old_region.0.wrapping_add_signed(dirty.delta)
-        } else {
-            dirty.start
-        };
-        let renumbered_end = if old_region.1 <= dirty.start {
-            old_region.1
-        } else if old_region.1 >= old_end {
-            old_region.1.wrapping_add_signed(dirty.delta)
-        } else {
-            dirty.end
-        };
+        // range kept their index, lines after it moved by `delta`. Visual mode
+        // has neither region, and so nothing to widen by.
+        if let Some(region) = region {
+            let old_end = dirty.old_end();
+            // A position inside the dirty range has no single new number; the
+            // range's own edge is always a safe (wider) choice.
+            let renumbered_start = if old_region.0 < dirty.start {
+                old_region.0
+            } else if old_region.0 >= old_end {
+                old_region.0.wrapping_add_signed(dirty.delta)
+            } else {
+                dirty.start
+            };
+            let renumbered_end = if old_region.1 <= dirty.start {
+                old_region.1
+            } else if old_region.1 >= old_end {
+                old_region.1.wrapping_add_signed(dirty.delta)
+            } else {
+                dirty.end
+            };
 
-        dirty.start = dirty.start.min(renumbered_start).min(region.0);
-        dirty.end = dirty
-            .end
-            .max(renumbered_end)
-            .max(region.1)
-            .min(self.lines.len());
+            dirty.start = dirty.start.min(renumbered_start).min(region.0);
+            dirty.end = dirty.end.max(renumbered_end).max(region.1);
+        }
+
+        dirty.end = dirty.end.min(self.lines.len());
         let old_end = dirty.old_end();
 
         // Segments ending before the range are untouched; so are the ones
@@ -1922,8 +2052,7 @@ impl MarkdownEditor {
         collect_segments(
             &self.lines,
             &self.fences,
-            self.active_start,
-            self.active_end,
+            self.active_region(),
             &mut segments,
         );
         self.segments = segments;
@@ -2114,6 +2243,10 @@ impl MarkdownEditor {
 
     /// Make a rendered segment covering `start..end` respond to the pointer
     /// line by line.
+    ///
+    /// Visual mode has nowhere to put a caret, so the segment is left bare:
+    /// no press is hit-tested and no drag is followed. Links inside it are
+    /// handled by the rendered Markdown itself and keep working.
     fn hit<'a>(
         &'a self,
         content: impl Into<Element<'a, Message>>,
@@ -2121,6 +2254,10 @@ impl MarkdownEditor {
         end: usize,
         dragging: bool,
     ) -> Element<'a, Message> {
+        if !self.is_editing() {
+            return content.into();
+        }
+
         let weights = self.line_heights.get(start..end).unwrap_or_default();
 
         document::Hit::new(content, start, weights, &self.text_hits, Message::ClickAt)
@@ -2129,7 +2266,14 @@ impl MarkdownEditor {
     }
 
     /// Ask the viewport to show the caret, the next time it is laid out.
+    ///
+    /// Visual mode draws no caret and puts no editor in the tree for the
+    /// viewport to measure against, so there is nothing to reveal.
     fn request_reveal(&mut self, mode: RevealMode) {
+        if !self.is_editing() {
+            return;
+        }
+
         let generation = self.reveal.map_or(1, |reveal| reveal.generation + 1);
 
         self.reveal = Some(Reveal {
@@ -2323,6 +2467,36 @@ impl MarkdownEditor {
         };
 
         to.abs_diff(from).max(1)
+    }
+
+    /// Scroll the document by `step`.
+    ///
+    /// Visual mode's answer to the arrow and page keys: there is no caret to
+    /// move them, and no focused widget for them to reach, so they move the
+    /// view directly. The scroll goes through an operation rather than a
+    /// computed offset so [`document::Viewport`] re-anchors to where it lands
+    /// — a target derived from `line_offsets` would be off by however much the
+    /// unmeasured lines in between were mis-estimated.
+    fn scroll_document(&self, step: ScrollStep) -> Task<Message> {
+        use iced::widget::operation::{AbsoluteOffset, RelativeOffset, scroll_by, snap_to};
+
+        let view_height = self
+            .viewport
+            .map_or(INITIAL_VIEWPORT_HEIGHT, |(_, height)| height);
+        let line = self.metrics().line_height;
+
+        let delta = match step {
+            ScrollStep::LineUp => -line,
+            ScrollStep::LineDown => line,
+            // A page keeps one line of overlap, so there is something to
+            // carry the eye across the jump.
+            ScrollStep::PageUp => line - view_height,
+            ScrollStep::PageDown => view_height - line,
+            ScrollStep::Start => return snap_to(DOCUMENT_ID, RelativeOffset::START),
+            ScrollStep::End => return snap_to(DOCUMENT_ID, RelativeOffset::END),
+        };
+
+        scroll_by(DOCUMENT_ID, AbsoluteOffset { x: 0.0, y: delta })
     }
 
     /// Top of `line` in content pixels, as measured or estimated.
@@ -2916,10 +3090,18 @@ impl MarkdownEditor {
                 }
             }
 
-            self.revision += 1;
-            if fences::signature(&self.lines[start..self.active_end]) != fences_before {
-                self.fences_dirty = true;
-                self.structure_changed = true;
+            if self.is_editing() {
+                self.revision += 1;
+                if fences::signature(&self.lines[start..self.active_end]) != fences_before {
+                    self.fences_dirty = true;
+                    self.structure_changed = true;
+                }
+            } else {
+                // Visual mode renders these lines from a *block*, not from
+                // `active_content`, so the block holding them has to be parsed
+                // again. The toolbar and the key bindings keep edits out of
+                // visual mode, but nothing about an edit makes that true.
+                self.touch_lines(start..self.active_end, &fences_before);
             }
         } else {
             let replacement: Vec<String> = (0..new_len)
@@ -3142,6 +3324,11 @@ impl MarkdownEditor {
 
     /// Move keyboard focus to the active line's editor.
     fn focus_active(&self) -> Task<Message> {
+        if !self.is_editing() {
+            // Visual mode has no editor in the tree to focus.
+            return Task::none();
+        }
+
         iced::widget::operation::focus(ACTIVE_LINE_ID)
     }
 }
@@ -3173,6 +3360,54 @@ fn panel_keys() -> Subscription<Message> {
             _ => None,
         }
     })
+}
+
+/// The keys visual mode answers to, where no widget holds the keyboard.
+fn visual_keys() -> Subscription<Message> {
+    iced::event::listen_with(|event, status, _window| {
+        let iced::Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) = event
+        else {
+            return None;
+        };
+
+        // A panel may well be open over the document, with one of its own
+        // controls focused; keys it consumed are its own.
+        (status == iced::event::Status::Ignored)
+            .then(|| visual_key(key.as_ref(), modifiers))
+            .flatten()
+    })
+}
+
+/// What a key press means in visual mode.
+///
+/// Only `Ctrl+E` — the way back to editing — and the keys that move the view,
+/// since there is no caret for them to move instead. Split out from
+/// [`visual_keys`] so the mapping is testable: `listen_with` takes a plain
+/// `fn` and a `Subscription` cannot be run from a test.
+fn visual_key(key: keyboard::Key<&str>, modifiers: keyboard::Modifiers) -> Option<Message> {
+    use keyboard::key::Named;
+
+    let step = if modifiers.command() {
+        match key {
+            keyboard::Key::Character("e") => return Some(Message::ToggleMode),
+            keyboard::Key::Named(Named::Home | Named::ArrowUp) => ScrollStep::Start,
+            keyboard::Key::Named(Named::End | Named::ArrowDown) => ScrollStep::End,
+            _ => return None,
+        }
+    } else {
+        match key {
+            keyboard::Key::Named(Named::ArrowUp) => ScrollStep::LineUp,
+            keyboard::Key::Named(Named::ArrowDown) => ScrollStep::LineDown,
+            keyboard::Key::Named(Named::PageUp) => ScrollStep::PageUp,
+            // `Space` pages down the way every reader does.
+            keyboard::Key::Named(Named::PageDown | Named::Space) => ScrollStep::PageDown,
+            keyboard::Key::Named(Named::Home) => ScrollStep::Start,
+            keyboard::Key::Named(Named::End) => ScrollStep::End,
+            _ => return None,
+        }
+    };
+
+    Some(Message::ScrollDocument(step))
 }
 
 /// The left mouse button being released, which ends a selection drag.
@@ -3210,22 +3445,18 @@ fn content_matches(content: &text_editor::Content, lines: &[String]) -> bool {
 /// block is part of the code, not a break between blocks: splitting there
 /// rendered one code block as two broken halves.
 ///
+/// `active` is `None` in visual mode, where no line is raw: the document then
+/// splits into blocks and blanks alone, and no [`Segment::Active`] is produced.
+///
 /// `out` is cleared and refilled so its allocation is reused across rebuilds.
 fn collect_segments(
     lines: &[String],
     code_blocks: &[(usize, usize)],
-    active_start: usize,
-    active_end: usize,
+    active: Option<(usize, usize)>,
     out: &mut Vec<Segment>,
 ) {
     out.clear();
-    walk_segments(
-        lines,
-        code_blocks,
-        (active_start, active_end),
-        0..lines.len(),
-        out,
-    );
+    walk_segments(lines, code_blocks, active, 0..lines.len(), out);
 }
 
 /// Append the [`Segment`]s of `lines[range]` to `out`, as a walk of the whole
@@ -3234,7 +3465,7 @@ fn collect_segments(
 fn walk_segments(
     lines: &[String],
     code_blocks: &[(usize, usize)],
-    (active_start, active_end): (usize, usize),
+    active: Option<(usize, usize)>,
     range: Range<usize>,
     out: &mut Vec<Segment>,
 ) {
@@ -3242,9 +3473,13 @@ fn walk_segments(
         |index: usize| !lines[index].trim().is_empty() || fences::in_code(code_blocks, index);
     let stop = range.end.min(lines.len());
     let mut index = range.start;
+    // In visual mode there is no raw region, so nothing interrupts a block.
+    let breaks_block = |index: usize| active.is_some_and(|(start, _)| index == start);
 
     while index < stop {
-        if index == active_start {
+        if let Some((active_start, active_end)) = active
+            && index == active_start
+        {
             out.push(Segment::Active);
             // `active_start < active_end` always holds, but force forward
             // progress regardless: a zero-width active range would otherwise
@@ -3255,7 +3490,7 @@ fn walk_segments(
             index += 1;
         } else {
             let start = index;
-            while index < stop && index != active_start && continues_block(index) {
+            while index < stop && !breaks_block(index) && continues_block(index) {
                 index += 1;
             }
             out.push(Segment::Block { start, end: index });
@@ -3635,6 +3870,8 @@ fn editor_binding(
             "a" => Some(Message::SelectAll),
             // The only way back once the toolbar is hidden.
             "," => Some(Message::ToggleSettingsPanel),
+            // Leaving for visual mode; `visual_keys` brings us back.
+            "e" => Some(Message::ToggleMode),
             _ => None,
         };
 
@@ -3813,8 +4050,27 @@ mod tests {
         collect_segments(
             lines,
             &fences::blocks(lines),
-            active_start,
-            active_end,
+            Some((active_start, active_end)),
+            &mut out,
+        );
+        out
+    }
+
+    /// The segments of a document with no raw region at all: visual mode.
+    fn rendered_segments(lines: &[String]) -> Vec<Segment> {
+        let mut out = Vec::new();
+        collect_segments(lines, &fences::blocks(lines), None, &mut out);
+        out
+    }
+
+    /// A from-scratch walk of `editor`'s document, in whichever mode it is in
+    /// — what its incrementally maintained segments must always equal.
+    fn walked_segments(editor: &MarkdownEditor) -> Vec<Segment> {
+        let mut out = Vec::new();
+        collect_segments(
+            &editor.lines,
+            &fences::blocks(&editor.lines),
+            editor.active_region(),
             &mut out,
         );
         out
@@ -3877,6 +4133,44 @@ mod tests {
                 Segment::Block { start: 0, end: 1 },
                 Segment::Blank(1),
                 Segment::Active,
+            ]
+        );
+    }
+
+    /// Visual mode's whole point: the cursor's line is grouped with the lines
+    /// around it like any other, so it renders exactly as they do.
+    #[test]
+    fn without_a_region_the_cursors_line_joins_its_block() {
+        let lines = to_lines("a\nb\nc");
+
+        assert_eq!(
+            segments(&lines, 1, 2),
+            vec![
+                Segment::Block { start: 0, end: 1 },
+                Segment::Active,
+                Segment::Block { start: 2, end: 3 },
+            ]
+        );
+        assert_eq!(
+            rendered_segments(&lines),
+            vec![Segment::Block { start: 0, end: 3 }]
+        );
+    }
+
+    /// Blank lines still break blocks in visual mode — they are what paragraph
+    /// spacing is made of — and a fenced block still holds its own blanks.
+    #[test]
+    fn without_a_region_blanks_and_fences_still_decide_the_blocks() {
+        let lines = to_lines("a\n\n```\n\nx\n```\n\nb");
+
+        assert_eq!(
+            rendered_segments(&lines),
+            vec![
+                Segment::Block { start: 0, end: 1 },
+                Segment::Blank(1),
+                Segment::Block { start: 2, end: 6 },
+                Segment::Blank(6),
+                Segment::Block { start: 7, end: 8 },
             ]
         );
     }
@@ -4537,10 +4831,15 @@ mod tests {
             &editor.lines[editor.active_start..editor.active_end]
         );
 
-        let fresh = segments(&editor.lines, editor.active_start, editor.active_end);
+        let fresh = walked_segments(editor);
         assert_eq!(
             editor.segments, fresh,
             "seed {seed} step {step}: cached segments diverged from a full walk"
+        );
+        assert_eq!(
+            editor.synced_region,
+            editor.active_region(),
+            "seed {seed} step {step}: segments were built for another region"
         );
 
         // The height tables are the sole offset↔line mapping: a length that
@@ -4732,6 +5031,10 @@ mod tests {
                 ][(r >> 8) as usize % 9]
                     .to_owned(),
             )))),
+            // Switching modes adds or removes the raw region, re-splitting the
+            // block the cursor is in; the steps that follow then run against
+            // the other mode's segmentation.
+            22 => Message::ToggleMode,
             // Undo and redo splice lines wherever the edit being undone was,
             // however far from the region — the hardest case for keeping the
             // segments up to date incrementally.
@@ -6525,6 +6828,237 @@ mod tests {
         ));
     }
 
+    // -- Visual / editor mode -------------------------------------------
+
+    /// Editor mode is what the editor opens in, so nothing about the existing
+    /// behaviour changes until the user asks for it.
+    #[test]
+    fn the_editor_starts_in_editor_mode() {
+        let (editor, _t) = MarkdownEditor::new_with_file(None);
+
+        assert_eq!(editor.settings.mode, settings::Mode::Editor);
+        assert_eq!(editor.active_region(), Some((0, 1)));
+        assert!(editor.segments.contains(&Segment::Active));
+    }
+
+    /// The point of visual mode: no line is raw, so the cursor's line renders
+    /// exactly like its neighbours — one block covers them all.
+    #[test]
+    fn visual_mode_renders_the_cursors_line_like_every_other() {
+        let mut editor = editor_with("alpha\nbeta\ngamma", 1, 0);
+        assert!(editor.segments.contains(&Segment::Active));
+
+        let _ = editor.update(Message::ToggleMode);
+
+        assert_eq!(editor.settings.mode, settings::Mode::Visual);
+        assert_eq!(editor.active_region(), None);
+        assert_eq!(editor.segments, vec![Segment::Block { start: 0, end: 3 }]);
+        assert_eq!(editor.block_sources, vec!["alpha\nbeta\ngamma"]);
+    }
+
+    /// And back: editor mode is today's behaviour, down to the region the
+    /// cursor was left in.
+    #[test]
+    fn returning_to_editor_mode_restores_the_raw_region() {
+        let mut editor = editor_with("alpha\nbeta\ngamma", 1, 2);
+
+        let _ = editor.update(Message::ToggleMode);
+        let _ = editor.update(Message::ToggleMode);
+
+        assert_eq!(editor.settings.mode, settings::Mode::Editor);
+        assert_eq!(editor.active_region(), Some((1, 2)));
+        assert_eq!(
+            editor.segments,
+            vec![
+                Segment::Block { start: 0, end: 1 },
+                Segment::Active,
+                Segment::Block { start: 2, end: 3 },
+            ]
+        );
+        assert_eq!(editor.cursor_position(), (1, 2));
+        assert_eq!(editor.block_sources, vec!["alpha", "gamma"]);
+    }
+
+    /// A table is one region in editor mode and one block in visual mode;
+    /// either way it must never be split into fragments.
+    #[test]
+    fn visual_mode_keeps_a_table_whole() {
+        let mut editor = editor_with("| A | B |\n|---|---|\n| 1 | 2 |", 1, 0);
+        assert_eq!(editor.active_region(), Some((0, 3)));
+
+        let _ = editor.update(Message::ToggleMode);
+
+        assert_eq!(editor.segments, vec![Segment::Block { start: 0, end: 3 }]);
+    }
+
+    /// Visual mode has no editor in the tree to hit-test into, so a stray
+    /// press must not plant a caret nobody can see.
+    #[test]
+    fn visual_mode_ignores_clicks_and_drags() {
+        let mut editor = editor_with("alpha\nbeta\ngamma", 0, 0);
+        let _ = editor.update(Message::ToggleMode);
+
+        let _ = editor.update(click(2));
+        let _ = editor.update(Message::DragTo(2));
+
+        assert_eq!(editor.cursor_position(), (0, 0));
+        assert!(editor.drag.is_none());
+        assert_eq!(editor.segments, vec![Segment::Block { start: 0, end: 3 }]);
+    }
+
+    /// The formatting toolbar is greyed out in visual mode; the message it
+    /// would have sent must be inert if it arrives anyway.
+    #[test]
+    fn visual_mode_does_not_format() {
+        let mut editor = editor_with("alpha", 0, 0);
+        let _ = editor.update(Message::ToggleMode);
+
+        let _ = editor.update(Message::Format(FormatAction::Bold));
+
+        assert_eq!(editor.document_text(), "alpha");
+        assert!(!editor.is_dirty);
+    }
+
+    /// Search replaces text through the raw region, which visual mode drops.
+    #[test]
+    fn entering_visual_mode_closes_the_search_bar() {
+        let mut editor = editor_with("alpha\nbeta", 0, 0);
+        let _ = editor.update(Message::OpenSearch { replace: true });
+        assert!(editor.search.is_some());
+
+        let _ = editor.update(Message::ToggleMode);
+
+        assert!(editor.search.is_none());
+    }
+
+    /// Nothing holds the keyboard in visual mode, so the keys it answers to —
+    /// `Ctrl+E` above all, the way back — have to be listened for globally.
+    #[test]
+    fn visual_mode_installs_a_key_listener() {
+        let (mut editor, _t) = MarkdownEditor::new_with_file(None);
+        assert!(editor.is_editing());
+
+        let _ = editor.update(Message::ToggleMode);
+        assert!(!editor.is_editing());
+
+        let _ = editor.update(Message::ToggleMode);
+        assert!(editor.is_editing());
+    }
+
+    /// `Ctrl+E` leaves editor mode from the editor's own key binding; the
+    /// listener above brings it back.
+    #[test]
+    fn ctrl_e_toggles_the_mode() {
+        let binding = editor_binding(ctrl_key_press("e"), BindingContext::default());
+
+        assert!(matches!(
+            binding,
+            Some(text_editor::Binding::Custom(Message::ToggleMode))
+        ));
+    }
+
+    /// Visual mode has no caret to move, so the navigation keys move the view.
+    /// `Ctrl+E` is the way back, and it has to come from here: there is no
+    /// focused widget left to carry the binding.
+    #[test]
+    fn visual_mode_keys_scroll_the_document() {
+        use keyboard::key::Named;
+
+        let plain = keyboard::Modifiers::empty();
+        let ctrl = keyboard::Modifiers::CTRL;
+        let named = keyboard::Key::Named;
+
+        assert!(matches!(
+            visual_key(keyboard::Key::Character("e"), ctrl),
+            Some(Message::ToggleMode)
+        ));
+
+        for (key, modifiers, expected) in [
+            (named(Named::ArrowUp), plain, ScrollStep::LineUp),
+            (named(Named::ArrowDown), plain, ScrollStep::LineDown),
+            (named(Named::PageUp), plain, ScrollStep::PageUp),
+            (named(Named::PageDown), plain, ScrollStep::PageDown),
+            (named(Named::Space), plain, ScrollStep::PageDown),
+            (named(Named::Home), plain, ScrollStep::Start),
+            (named(Named::End), plain, ScrollStep::End),
+            // `Ctrl` with a vertical key jumps to the document's edge, as it
+            // does while editing.
+            (named(Named::ArrowUp), ctrl, ScrollStep::Start),
+            (named(Named::ArrowDown), ctrl, ScrollStep::End),
+        ] {
+            let actual = visual_key(key.clone(), modifiers);
+            assert!(
+                matches!(&actual, Some(Message::ScrollDocument(step)) if *step == expected),
+                "{key:?} with {modifiers:?} gave {actual:?}"
+            );
+        }
+
+        // Typing is not an edit in visual mode; it is not anything.
+        assert!(visual_key(keyboard::Key::Character("a"), plain).is_none());
+        assert!(visual_key(named(Named::Backspace), plain).is_none());
+    }
+
+    #[test]
+    fn the_mode_is_remembered_across_restarts() {
+        let config = Config {
+            settings: Settings {
+                mode: settings::Mode::Visual,
+                ..Settings::default()
+            },
+            colors: MarkdownColors::default(),
+        };
+
+        let (editor, _t) = MarkdownEditor::new(config, None);
+
+        assert!(!editor.is_editing());
+        assert_eq!(editor.active_region(), None);
+        assert!(!editor.segments.contains(&Segment::Active));
+    }
+
+    /// Opening a file must not drop back into editor mode: `load_document`
+    /// replaces the document, never the preferences.
+    #[test]
+    fn a_file_opens_in_visual_mode_when_the_preference_says_so() {
+        let config = Config {
+            settings: Settings {
+                mode: settings::Mode::Visual,
+                ..Settings::default()
+            },
+            colors: MarkdownColors::default(),
+        };
+
+        let (mut editor, _t) = MarkdownEditor::new(config, Some(PathBuf::from("/tmp/arg.md")));
+        let _ = editor.update(Message::FileOpened(Ok((
+            PathBuf::from("/tmp/arg.md"),
+            Arc::new(String::from("# Opened\n\nbody")),
+        ))));
+
+        assert_eq!(editor.current_file, Some(PathBuf::from("/tmp/arg.md")));
+        assert!(!editor.is_editing());
+        assert_eq!(editor.active_region(), None);
+        assert!(!editor.segments.contains(&Segment::Active));
+    }
+
+    /// The view is built from the segments and the dense block vectors; in
+    /// visual mode there is no editor child to force into the window either.
+    #[test]
+    fn the_view_renders_in_visual_mode() {
+        let mut editor = editor_with("# Title\n\nbody\n\n```rust\nfn a() {}\n```", 2, 0);
+        let _ = editor.update(Message::ToggleMode);
+
+        let _element = editor.view();
+    }
+
+    #[test]
+    fn the_status_bar_reports_the_mode_instead_of_a_caret() {
+        let mut editor = editor_with("alpha\nbeta", 1, 2);
+        let _ = editor.update(Message::ToggleMode);
+
+        // The caret is still where it was; it is simply not drawn.
+        assert_eq!(editor.cursor_position(), (1, 2));
+        let _element = editor.view();
+    }
+
     // -- Session restore ------------------------------------------------
 
     #[test]
@@ -6604,7 +7138,7 @@ mod tests {
     /// The block sources a *full* rebuild would produce, used as the ground
     /// truth the incremental [`MarkdownEditor::rebuild_blocks`] must match.
     fn expected_block_sources(editor: &MarkdownEditor) -> Vec<String> {
-        segments(&editor.lines, editor.active_start, editor.active_end)
+        walked_segments(editor)
             .into_iter()
             .filter_map(|segment| match segment {
                 Segment::Block { start, end } => Some(editor.lines[start..end].join("\n")),

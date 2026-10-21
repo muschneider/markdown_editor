@@ -111,6 +111,18 @@ icon!(
 );
 
 icon!(
+    /// Switch to visual mode — read the document with every line rendered (eye).
+    eye = "<path d=\"M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z\"/>\
+           <circle cx=\"12\" cy=\"12\" r=\"3\"/>"
+);
+
+icon!(
+    /// Switch to editor mode — edit the cursor's line as raw source (pencil).
+    pencil = "<path d=\"M17 3a2.83 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z\"/>\
+              <path d=\"m15 5 4 4\"/>"
+);
+
+icon!(
     /// Open the settings panel (sliders).
     settings = "<line x1=\"4\" y1=\"7\" x2=\"20\" y2=\"7\"/><line x1=\"4\" y1=\"17\" x2=\"20\" y2=\"17\"/>\
                 <circle cx=\"9\" cy=\"7\" r=\"2.5\"/><circle cx=\"16\" cy=\"17\" r=\"2.5\"/>"

@@ -25,7 +25,7 @@ use iced::{Event, Font, Pixels, Point, Rectangle, Size, Task, Vector, mouse, win
 use iced_runtime::user_interface::{Cache, UserInterface};
 use iced_runtime::{Action, task};
 
-use super::{ACTIVE_LINE_ID, DOCUMENT_ID, MarkdownEditor, Message, RevealMode};
+use super::{ACTIVE_LINE_ID, DOCUMENT_ID, MarkdownEditor, Message, RevealMode, ScrollStep};
 use crate::fences;
 
 /// Frames run by [`Harness::settle`] before it gives up on the UI going quiet.
@@ -213,17 +213,25 @@ impl Harness {
 
     /// Measure where the document and the caret are right now.
     pub fn geometry(&mut self) -> Geometry {
+        let (viewport, offset, editor) = self.probe();
+
+        Geometry {
+            viewport,
+            offset,
+            editor: editor.expect("the active editor"),
+        }
+    }
+
+    /// Where the document is scrolled to, and the active editor's bounds —
+    /// `None` in visual mode, which puts no editor in the tree at all.
+    pub fn probe(&mut self) -> (Rectangle, Vector, Option<Rectangle>) {
         let mut probe = Probe::default();
         let mut ui = build(&self.editor, &mut self.cache, &mut self.renderer);
         ui.operate(&self.renderer, &mut probe);
         self.cache = ui.into_cache();
 
         let (viewport, offset) = probe.scrollable.expect("the document scrollable");
-        Geometry {
-            viewport,
-            offset,
-            editor: probe.editor.expect("the active editor"),
-        }
+        (viewport, offset, probe.editor)
     }
 
     /// Run frames until no messages or operations are left, delivering
@@ -694,6 +702,81 @@ fn opening_panels_keeps_the_document_where_it_was() {
             "{label}: closing moved the document from {before} to {closed}"
         );
     }
+}
+
+/// Visual mode takes the raw editor out of the widget tree altogether — that
+/// is what makes the cursor's line render like the rest. The `Viewport`
+/// anchors to the document either way, so switching must not move it.
+#[test]
+fn visual_mode_removes_the_editor_without_moving_the_document() {
+    let mut harness = Harness::new(&sectioned_document(200));
+    for _ in 0..40 {
+        harness.scroll(40.0);
+    }
+
+    let (.., editing) = harness.probe();
+    assert!(editing.is_some(), "editor mode must have an editor");
+    let before = harness.geometry().offset.y;
+    assert!(before > 1_000.0, "scrolled down: {before}");
+
+    harness.send(Message::ToggleMode);
+    let (.., visual) = harness.probe();
+    let (_, offset, _) = harness.probe();
+
+    assert!(visual.is_none(), "visual mode must have no editor");
+    // The caret is far above the view, so returning to it would scroll away;
+    // leaving it behind must not.
+    assert!(
+        (offset.y - before).abs() < 400.0,
+        "entering visual mode moved the document from {before} to {}",
+        offset.y
+    );
+
+    harness.send(Message::ToggleMode);
+    let (.., back) = harness.probe();
+    assert!(back.is_some(), "editor mode must put the editor back");
+}
+
+/// Visual mode's arrow and page keys move the view, since there is no caret
+/// for them to move and no focused widget for them to reach.
+///
+/// The keys themselves arrive through a subscription, which lives outside the
+/// `UserInterface` this harness drives; `visual_key` maps them to these
+/// messages (asserted in `app.rs`), and this is the half that needs a real
+/// layout to mean anything.
+#[test]
+fn visual_mode_scrolls_with_the_keyboard() {
+    let mut harness = Harness::new(&sectioned_document(200));
+    harness.send(Message::ToggleMode);
+
+    let top = harness.probe().1.y;
+    assert!(top < 1.0, "starts at the top: {top}");
+
+    harness.send(Message::ScrollDocument(ScrollStep::PageDown));
+    let paged = harness.probe().1.y;
+    assert!(paged > 100.0, "PageDown scrolled to {paged}");
+
+    harness.send(Message::ScrollDocument(ScrollStep::LineDown));
+    let stepped = harness.probe().1.y;
+    assert!(
+        stepped > paged,
+        "LineDown scrolled from {paged} to {stepped}"
+    );
+
+    harness.send(Message::ScrollDocument(ScrollStep::LineUp));
+    let back = harness.probe().1.y;
+    assert!(
+        (back - paged).abs() < 1.0,
+        "LineUp returned to {paged}, not {back}"
+    );
+
+    harness.send(Message::ScrollDocument(ScrollStep::Start));
+    let home = harness.probe().1.y;
+    assert!(home < 1.0, "Start returned to the top, not {home}");
+
+    harness.send(Message::ScrollDocument(ScrollStep::End));
+    let end = harness.probe().1.y;
+    assert!(end > paged, "End scrolled to the bottom, not {end}");
 }
 
 /// A match found far down the document is scrolled to, with context above
