@@ -28,7 +28,7 @@
 
 use std::cell::RefCell;
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use iced::widget::{
@@ -48,7 +48,7 @@ use crate::html;
 use crate::icons;
 use crate::markdown_view;
 use crate::search::{self, Search};
-use crate::settings::{self, FontSize, Settings, WrapWidth};
+use crate::settings::{self, FontSize, Mode, Settings, WrapWidth};
 use crate::source_map;
 use crate::theme as app_theme;
 use crate::theme::{MarkdownColors, MarkdownTag};
@@ -300,6 +300,14 @@ pub struct MarkdownEditor {
     /// The single source of truth for the selected theme — there is no separate
     /// `theme` field to keep in sync.
     settings: Settings,
+    /// The mode written back to the config file, as opposed to the one in use.
+    ///
+    /// Normally equal to `settings.mode`. A `--visual` / `--editor` flag
+    /// overrides the mode for one run without rewriting the stored preference,
+    /// so the two differ until the user toggles the mode themselves. Only
+    /// [`MarkdownEditor::save_config`] reads this; every decision about whether
+    /// editing applies goes through [`MarkdownEditor::active_region`].
+    persisted_mode: Mode,
     /// Per-tag Markdown color overrides. Empty strings follow the theme; valid
     /// hex strings override a single tag's color.
     colors: MarkdownColors,
@@ -670,7 +678,7 @@ impl MarkdownEditor {
     /// developer happens to have in `~/.config/md_editor/config.yaml`.
     #[cfg(test)]
     fn new_with_file(initial_file: Option<PathBuf>) -> (Self, Task<Message>) {
-        Self::new(Config::default(), initial_file)
+        Self::new(Config::default(), initial_file, None)
     }
 
     /// Create a new editor instance from `config`.
@@ -681,8 +689,21 @@ impl MarkdownEditor {
     /// leaves the welcome document on error. With no path given, the file
     /// remembered by [`Settings::file_to_restore`] is opened instead — a
     /// command-line argument always wins over the restored session.
-    pub fn new(config: Config, initial_file: Option<PathBuf>) -> (Self, Task<Message>) {
+    ///
+    /// `mode_override` is the `--visual` / `--editor` flag: it decides how this
+    /// run starts without touching the mode remembered in the config file.
+    pub fn new(
+        config: Config,
+        initial_file: Option<PathBuf>,
+        mode_override: Option<Mode>,
+    ) -> (Self, Task<Message>) {
         let restored = initial_file.or_else(|| config.settings.file_to_restore());
+
+        let persisted_mode = config.settings.mode;
+        let mut settings = config.settings;
+        if let Some(mode) = mode_override {
+            settings.mode = mode;
+        }
 
         let mut editor = Self {
             lines: split_lines(WELCOME_MD),
@@ -716,7 +737,8 @@ impl MarkdownEditor {
             current_file: None,
             is_dirty: false,
             is_loading: false,
-            settings: config.settings,
+            settings,
+            persisted_mode,
             colors: config.colors,
             show_settings_panel: false,
             show_color_panel: false,
@@ -746,10 +768,42 @@ impl MarkdownEditor {
     /// Fire-and-forget: [`config::save`] writes off the UI thread and swallows
     /// every error, so this is safe to call from any message handler.
     fn save_config(&self) {
-        config::save(&Config {
-            settings: self.settings.clone(),
+        config::save(&self.config_to_save());
+    }
+
+    /// The configuration as it should be written to disk.
+    ///
+    /// Everything is taken from the live state except the mode, which comes
+    /// from [`MarkdownEditor::persisted_mode`]: a startup flag changes the mode
+    /// for this run only, so what reaches the file is the mode the user last
+    /// chose themselves. Swapped here, at the file boundary, rather than
+    /// anywhere a mode is read.
+    fn config_to_save(&self) -> Config {
+        let mut settings = self.settings.clone();
+        settings.mode = self.persisted_mode;
+
+        Config {
+            settings,
             colors: self.colors.clone(),
-        });
+        }
+    }
+
+    /// The folder a file dialog should start in: the open document's, else the
+    /// one remembered from last time.
+    ///
+    /// Without it the GTK chooser opens on "Recent files" — a list of whatever
+    /// the user last touched in any application, rather than anywhere near the
+    /// document they are editing. `save_file_dialog` has always set one; this
+    /// is the same courtesy for opening.
+    fn dialog_directory(&self) -> Option<PathBuf> {
+        self.current_file
+            .as_ref()
+            .or(self.settings.last_file.as_ref())
+            .and_then(|path| path.parent())
+            // A remembered file may since have been moved or unmounted, and
+            // pointing the chooser at a folder that is gone leaves it blank.
+            .filter(|parent| parent.is_dir())
+            .map(Path::to_path_buf)
     }
 
     /// Remember `path` as the most recently used file and persist it.
@@ -1073,8 +1127,15 @@ impl MarkdownEditor {
                 }
                 self.is_loading = true;
 
+                let directory = Arc::new(self.dialog_directory());
+
                 window::oldest()
-                    .and_then(|id| window::run(id, file_ops::open_file_dialog))
+                    .and_then(move |id| {
+                        let directory = directory.clone();
+                        window::run(id, move |w| {
+                            file_ops::open_file_dialog(w, (*directory).clone())
+                        })
+                    })
                     .then(Task::future)
                     .map(Message::FileOpened)
             }
@@ -1164,6 +1225,9 @@ impl MarkdownEditor {
             }
             Message::ToggleMode => {
                 self.settings.mode = self.settings.mode.toggled();
+                // Toggling is a deliberate choice, so it becomes the stored
+                // preference — superseding whatever a startup flag asked for.
+                self.persisted_mode = self.settings.mode;
 
                 // The search bar replaces text through the raw region, which
                 // visual mode does not have.
@@ -1302,6 +1366,23 @@ impl MarkdownEditor {
                 Task::none()
             }
             Message::OpenSearch { replace } => {
+                // Every part of searching runs through the raw region: it is
+                // the highlight (`select_in_active`), the scroll target
+                // (`request_reveal`) and the text `Replace` rewrites. Visual
+                // mode has none, so `Ctrl+F` resumes editing instead of
+                // opening a bar that could not show a single result.
+                //
+                // Deliberately *not* persisted: the user asked to find
+                // something, not to change which mode the editor starts in, so
+                // `persisted_mode` is left alone the way a startup flag is.
+                if !self.is_editing() {
+                    self.settings.mode = Mode::Editor;
+                    // Adding the raw region re-splits the block the cursor is
+                    // in; there is no incremental path between the two
+                    // segmentations.
+                    self.rebuild();
+                }
+
                 match &mut self.search {
                     // Already open: `Ctrl+H` upgrades a find bar to a replace
                     // bar, and either shortcut re-focuses the query input so
@@ -3378,20 +3459,68 @@ fn visual_keys() -> Subscription<Message> {
     })
 }
 
+/// The application shortcuts that mean the same thing in both modes.
+///
+/// Matched on the *unmodified* key so they keep working on keyboard layouts
+/// where a modifier changes the produced character.
+///
+/// This is the one list, consulted by [`editor_binding`] and [`visual_key`]
+/// alike, because the two cannot be allowed to drift: `editor_binding` only
+/// exists while an editor is in the tree, so a shortcut listed only there is
+/// dead in visual mode — and for most of these the toolbar button stays
+/// enabled, leaving a control that answers the mouse but not the keyboard.
+///
+/// Most act on no caret at all. `Ctrl+F`/`Ctrl+H` are the exception: searching
+/// needs the raw region (see [`MarkdownEditor::reveal_current_match`]), so the
+/// *handler* leaves visual mode rather than the key meaning something
+/// different here. Only the shortcuts with no sensible visual-mode behaviour
+/// at all — formatting, undo/redo, select-all — stay in [`editor_binding`].
+fn app_shortcut(key: keyboard::Key<&str>, modifiers: keyboard::Modifiers) -> Option<Message> {
+    if !modifiers.command() {
+        return None;
+    }
+
+    let keyboard::Key::Character(c) = key else {
+        return None;
+    };
+
+    match c {
+        "n" => Some(Message::NewFile),
+        "o" => Some(Message::OpenFile),
+        "s" => Some(Message::SaveFile),
+        "f" => Some(Message::OpenSearch { replace: false }),
+        "h" => Some(Message::OpenSearch { replace: true }),
+        // The only way back once the toolbar is hidden.
+        "," => Some(Message::ToggleSettingsPanel),
+        // Leaving for visual mode, and the way back out of it.
+        "e" => Some(Message::ToggleMode),
+        _ => None,
+    }
+}
+
 /// What a key press means in visual mode.
 ///
-/// Only `Ctrl+E` — the way back to editing — and the keys that move the view,
-/// since there is no caret for them to move instead. Split out from
-/// [`visual_keys`] so the mapping is testable: `listen_with` takes a plain
-/// `fn` and a `Subscription` cannot be run from a test.
+/// [`app_shortcut`]'s shortcuts — `Ctrl+E` above all, the way back to editing —
+/// and the keys that move the view, since there is no caret for them to move
+/// instead. Split out from [`visual_keys`] so the mapping is testable:
+/// `listen_with` takes a plain `fn` and a `Subscription` cannot be run from a
+/// test.
 fn visual_key(key: keyboard::Key<&str>, modifiers: keyboard::Modifiers) -> Option<Message> {
     use keyboard::key::Named;
 
+    if let Some(message) = app_shortcut(key.clone(), modifiers) {
+        return Some(message);
+    }
+
     let step = if modifiers.command() {
+        // `Ctrl` with any vertical key jumps to the document's edge, matching
+        // `JumpToStart`/`JumpToEnd` in [`editor_binding`] — including
+        // `Ctrl+PgUp`/`Ctrl+PgDn`, which editing answers to as well.
         match key {
-            keyboard::Key::Character("e") => return Some(Message::ToggleMode),
-            keyboard::Key::Named(Named::Home | Named::ArrowUp) => ScrollStep::Start,
-            keyboard::Key::Named(Named::End | Named::ArrowDown) => ScrollStep::End,
+            keyboard::Key::Named(Named::Home | Named::ArrowUp | Named::PageUp) => ScrollStep::Start,
+            keyboard::Key::Named(Named::End | Named::ArrowDown | Named::PageDown) => {
+                ScrollStep::End
+            }
             _ => return None,
         }
     } else {
@@ -3825,8 +3954,9 @@ fn clamp_column(line: &str, column: usize) -> usize {
 /// - **PgUp/PgDn** move the active line by a page; **Ctrl+Home/End** (and
 ///   **Ctrl+PgUp/PgDn**) jump to the document start/end.
 /// - **Ctrl+A** selects the whole document.
-/// - **Ctrl+N/O/S** file actions, **Ctrl+Z / Ctrl+Y** undo/redo,
-///   **Ctrl+B / Ctrl+I** bold/italic.
+/// - **Ctrl+Z / Ctrl+Y** undo/redo, **Ctrl+B / Ctrl+I** bold/italic,
+///   **Ctrl+F / Ctrl+H** find and replace — all of which act on the caret, so
+///   they stop here. The rest are [`app_shortcut`]'s and work in both modes.
 ///
 /// Everything else falls through to the default editor bindings, which operate
 /// *within* the active region — and since the region always covers the whole
@@ -3855,27 +3985,21 @@ fn editor_binding(
     // working on keyboard layouts where a modifier changes the produced
     // character.
     if command && let keyboard::Key::Character(c) = key.as_ref() {
-        let message = match c {
-            "n" => Some(Message::NewFile),
-            "o" => Some(Message::OpenFile),
-            "s" => Some(Message::SaveFile),
+        // Only the shortcuts that act on the caret are listed here; the rest
+        // (file actions, the settings panel, `Ctrl+E`) are `app_shortcut`'s,
+        // shared with visual mode so the two cannot disagree.
+        let caret_bound = match c {
             "b" => Some(Message::Format(FormatAction::Bold)),
             "i" => Some(Message::Format(FormatAction::Italic)),
             "z" if shift => Some(Message::Redo),
             "z" => Some(Message::Undo),
             "y" => Some(Message::Redo),
-            "f" => Some(Message::OpenSearch { replace: false }),
-            "h" => Some(Message::OpenSearch { replace: true }),
             // Select the *document*, not just the raw region the editor holds.
             "a" => Some(Message::SelectAll),
-            // The only way back once the toolbar is hidden.
-            "," => Some(Message::ToggleSettingsPanel),
-            // Leaving for visual mode; `visual_keys` brings us back.
-            "e" => Some(Message::ToggleMode),
             _ => None,
         };
 
-        if let Some(message) = message {
+        if let Some(message) = app_shortcut(key.as_ref(), modifiers).or(caret_bound) {
             return Some(Binding::Custom(message));
         }
 
@@ -6982,9 +7106,13 @@ mod tests {
             (named(Named::Home), plain, ScrollStep::Start),
             (named(Named::End), plain, ScrollStep::End),
             // `Ctrl` with a vertical key jumps to the document's edge, as it
-            // does while editing.
+            // does while editing — the page keys included.
             (named(Named::ArrowUp), ctrl, ScrollStep::Start),
             (named(Named::ArrowDown), ctrl, ScrollStep::End),
+            (named(Named::Home), ctrl, ScrollStep::Start),
+            (named(Named::End), ctrl, ScrollStep::End),
+            (named(Named::PageUp), ctrl, ScrollStep::Start),
+            (named(Named::PageDown), ctrl, ScrollStep::End),
         ] {
             let actual = visual_key(key.clone(), modifiers);
             assert!(
@@ -6998,6 +7126,91 @@ mod tests {
         assert!(visual_key(named(Named::Backspace), plain).is_none());
     }
 
+    /// The shortcuts that mean the same thing in both modes have to *work* in
+    /// both: most of their toolbar buttons stay enabled in visual mode, and a
+    /// control that answers the mouse but not the keyboard is just a broken
+    /// keybind. They used to live in `editor_binding` alone, so visual mode had
+    /// no file actions, no search and no way to the settings panel at all.
+    #[test]
+    fn the_shared_shortcuts_work_in_both_modes() {
+        let ctrl = keyboard::Modifiers::CTRL;
+
+        for (character, expected) in [
+            ("n", "NewFile"),
+            ("o", "OpenFile"),
+            ("s", "SaveFile"),
+            ("f", "OpenSearch"),
+            ("h", "OpenSearch"),
+            (",", "ToggleSettingsPanel"),
+            ("e", "ToggleMode"),
+        ] {
+            // Both sides are asked, and both must answer the same way.
+            let visual = visual_key(keyboard::Key::Character(character), ctrl);
+            let editing = editor_binding(ctrl_key_press(character), BindingContext::default());
+
+            let visual = format!("{visual:?}");
+            assert!(
+                visual.contains(expected),
+                "Ctrl+{character} in visual mode gave {visual}"
+            );
+
+            let editing = format!("{editing:?}");
+            assert!(
+                editing.contains(expected),
+                "Ctrl+{character} while editing gave {editing}"
+            );
+        }
+    }
+
+    /// The other half of the split: a shortcut that acts on a caret or a
+    /// selection has nothing to act on in visual mode — the toolbar greys
+    /// these out to match — and must not be smuggled in by the shared list.
+    #[test]
+    fn the_caret_bound_shortcuts_stay_out_of_visual_mode() {
+        let ctrl = keyboard::Modifiers::CTRL;
+
+        for character in ["b", "i", "z", "y", "a"] {
+            let actual = visual_key(keyboard::Key::Character(character), ctrl);
+            assert!(
+                actual.is_none(),
+                "Ctrl+{character} needs a caret, but visual mode gave {actual:?}"
+            );
+        }
+    }
+
+    /// `Ctrl+F` in visual mode has to *land* somewhere useful, not just emit a
+    /// message: the bar highlights a match by selecting it in the raw region
+    /// and scrolls to it by revealing that region, so opening one with no
+    /// region would show `1/3` and never move. Searching therefore resumes
+    /// editing — without rewriting the remembered mode, since finding text is
+    /// not a request to change how the editor starts.
+    #[test]
+    fn searching_from_visual_mode_resumes_editing() {
+        let mut editor = editor_with("alpha\n\nbeta alpha\n\ngamma", 0, 0);
+        let _ = editor.update(Message::ToggleMode);
+        assert!(!editor.is_editing());
+        assert_eq!(editor.persisted_mode, settings::Mode::Visual);
+
+        let _ = editor.update(Message::OpenSearch { replace: false });
+
+        assert!(editor.is_editing(), "the bar needs a raw region to show in");
+        assert!(editor.search.is_some());
+        // The region is back in the segments, so `view` has an editor to put
+        // the match's line in.
+        assert!(editor.segments.contains(&Segment::Active));
+        assert_eq!(
+            editor.persisted_mode,
+            settings::Mode::Visual,
+            "searching is not a mode preference"
+        );
+
+        // And the search itself works from there.
+        let _ = editor.update(Message::SearchQueryChanged(String::from("alpha")));
+        assert_eq!(editor.search.as_ref().unwrap().count(), 2);
+        let _ = editor.update(Message::FindNext);
+        assert_eq!(editor.cursor_position().0, 2);
+    }
+
     #[test]
     fn the_mode_is_remembered_across_restarts() {
         let config = Config {
@@ -7008,11 +7221,121 @@ mod tests {
             colors: MarkdownColors::default(),
         };
 
-        let (editor, _t) = MarkdownEditor::new(config, None);
+        let (editor, _t) = MarkdownEditor::new(config, None, None);
 
         assert!(!editor.is_editing());
         assert_eq!(editor.active_region(), None);
         assert!(!editor.segments.contains(&Segment::Active));
+    }
+
+    /// `--visual` on a config that says `editor`.
+    #[test]
+    fn a_startup_mode_flag_overrides_the_stored_preference() {
+        let (editor, _t) =
+            MarkdownEditor::new(Config::default(), None, Some(settings::Mode::Visual));
+
+        assert_eq!(Config::default().settings.mode, settings::Mode::Editor);
+        assert!(!editor.is_editing());
+        assert_eq!(editor.active_region(), None);
+    }
+
+    /// The whole point of the flag being an override: reading one file in
+    /// visual mode must not change what every later launch does.
+    #[test]
+    fn a_startup_mode_flag_is_never_written_back_to_the_config() {
+        let (mut editor, _t) = MarkdownEditor::new(
+            Config::default(),
+            Some(PathBuf::from("/tmp/arg.md")),
+            Some(settings::Mode::Visual),
+        );
+
+        // Opening a file persists `last_file`, which is what would have
+        // dragged the overridden mode to disk along with it.
+        let _ = editor.update(Message::FileOpened(Ok((
+            PathBuf::from("/tmp/arg.md"),
+            Arc::new(String::from("# Opened")),
+        ))));
+
+        assert!(!editor.is_editing(), "the run itself is in visual mode");
+        assert_eq!(
+            editor.config_to_save().settings.mode,
+            settings::Mode::Editor,
+            "the stored preference must be untouched"
+        );
+        assert_eq!(
+            editor.config_to_save().settings.last_file,
+            Some(PathBuf::from("/tmp/arg.md")),
+            "while everything else is still persisted"
+        );
+    }
+
+    /// Toggling by hand is a deliberate choice, so it supersedes the flag.
+    #[test]
+    fn toggling_after_a_startup_flag_persists_the_new_mode() {
+        let (mut editor, _t) =
+            MarkdownEditor::new(Config::default(), None, Some(settings::Mode::Visual));
+
+        let _ = editor.update(Message::ToggleMode);
+
+        assert!(editor.is_editing());
+        assert_eq!(
+            editor.config_to_save().settings.mode,
+            settings::Mode::Editor
+        );
+
+        let _ = editor.update(Message::ToggleMode);
+
+        assert!(!editor.is_editing());
+        assert_eq!(
+            editor.config_to_save().settings.mode,
+            settings::Mode::Visual,
+            "a hand toggle is what the user chose; remember it"
+        );
+    }
+
+    /// The open dialog starts in the document's folder. Left unset, GTK opens
+    /// on "Recent files" instead of anywhere near what is being edited.
+    #[test]
+    fn the_open_dialog_starts_in_the_documents_folder() {
+        let (mut editor, _t) = MarkdownEditor::new_with_file(None);
+        assert_eq!(
+            editor.dialog_directory(),
+            None,
+            "nothing open, nothing to go on"
+        );
+
+        // `/tmp` exists, so its own directory is offered.
+        editor.current_file = Some(PathBuf::from("/tmp/notes.md"));
+        assert_eq!(editor.dialog_directory(), Some(PathBuf::from("/tmp")));
+
+        // With no file open, the remembered one still says where the user was.
+        editor.current_file = None;
+        editor.settings.last_file = Some(PathBuf::from("/tmp/earlier.md"));
+        assert_eq!(editor.dialog_directory(), Some(PathBuf::from("/tmp")));
+
+        // A folder that has since gone is no use: the chooser would open blank.
+        editor.settings.last_file = Some(PathBuf::from("/nonexistent-ws-dir/gone/earlier.md"));
+        assert_eq!(editor.dialog_directory(), None);
+    }
+
+    /// Without a flag, the stored preference decides and round-trips.
+    #[test]
+    fn without_a_flag_the_stored_mode_is_used_and_kept() {
+        let config = Config {
+            settings: Settings {
+                mode: settings::Mode::Visual,
+                ..Settings::default()
+            },
+            colors: MarkdownColors::default(),
+        };
+
+        let (editor, _t) = MarkdownEditor::new(config, None, None);
+
+        assert!(!editor.is_editing());
+        assert_eq!(
+            editor.config_to_save().settings.mode,
+            settings::Mode::Visual
+        );
     }
 
     /// Opening a file must not drop back into editor mode: `load_document`
@@ -7027,7 +7350,8 @@ mod tests {
             colors: MarkdownColors::default(),
         };
 
-        let (mut editor, _t) = MarkdownEditor::new(config, Some(PathBuf::from("/tmp/arg.md")));
+        let (mut editor, _t) =
+            MarkdownEditor::new(config, Some(PathBuf::from("/tmp/arg.md")), None);
         let _ = editor.update(Message::FileOpened(Ok((
             PathBuf::from("/tmp/arg.md"),
             Arc::new(String::from("# Opened\n\nbody")),
@@ -7075,14 +7399,15 @@ mod tests {
         // Both paths produce a load task, so assert on the state that decided
         // it: the editor is loading either way, and `file_to_restore` is what
         // `new` falls back to only when no argument was given.
-        let (editor, _t) = MarkdownEditor::new(config.clone(), Some(PathBuf::from("/tmp/cli.md")));
+        let (editor, _t) =
+            MarkdownEditor::new(config.clone(), Some(PathBuf::from("/tmp/cli.md")), None);
         assert!(editor.is_loading);
         assert_eq!(
             editor.settings.file_to_restore(),
             Some(PathBuf::from("/tmp/remembered.md"))
         );
 
-        let (restored, _t) = MarkdownEditor::new(config, None);
+        let (restored, _t) = MarkdownEditor::new(config, None, None);
         assert!(restored.is_loading);
     }
 
@@ -7097,7 +7422,7 @@ mod tests {
             colors: MarkdownColors::default(),
         };
 
-        let (editor, _t) = MarkdownEditor::new(config, None);
+        let (editor, _t) = MarkdownEditor::new(config, None, None);
 
         assert!(!editor.is_loading);
         assert_eq!(editor.current_file, None);

@@ -624,6 +624,86 @@ fn a_click_in_code_lands_on_the_letter_clicked() {
     );
 }
 
+/// Prose is justified: every row of a paragraph but the last is stretched to
+/// one common width, so the gaps between its words are wider than the font
+/// made them. A press must still land on the character the reader sees under
+/// the pointer, which it only does if the hit test lays the text out exactly
+/// the way it was drawn — justification and all.
+#[test]
+fn a_click_in_a_justified_paragraph_lands_on_the_letter_clicked() {
+    use iced::advanced::text::{self, Paragraph as _};
+
+    // One source line, long enough to wrap into several rows of uneven
+    // natural width — the slack justification has to spread into.
+    let source = "Justified prose is stretched row by row until every row but \
+                  the last ends in the same place, and a paragraph only reads \
+                  as a block of text once it does. The rows this one wraps \
+                  into are of quite different natural widths, so the gaps \
+                  between their words have to grow by quite different amounts \
+                  to even them out, which is exactly what a press has to be \
+                  measured against.";
+    let mut harness = Harness::new(&format!("intro\n\n{source}"));
+
+    // The block's content box, the width the document column measured for it.
+    let width = harness.editor.measured_width - 2.0 * f32::from(super::LINE_PADDING);
+    let size = 16.0;
+    let laid_out = |align: text::Alignment| {
+        <iced::Renderer as text::Renderer>::Paragraph::with_text(text::Text {
+            content: source,
+            bounds: Size::new(width, f32::INFINITY),
+            size: Pixels(size),
+            line_height: text::LineHeight::default(),
+            font: Font::DEFAULT,
+            align_x: align,
+            align_y: iced::alignment::Vertical::Top,
+            shaping: text::Shaping::Advanced,
+            wrapping: text::Wrapping::Word,
+        })
+    };
+
+    let justified = laid_out(text::Alignment::Justified);
+    let ragged = laid_out(text::Alignment::Default);
+
+    let row = size * super::LINE_HEIGHT;
+    let rows = (justified.min_bounds().height / row).round() as usize;
+    let span = justified.min_bounds().width as usize;
+    assert!(
+        rows >= 3,
+        "the paragraph has to wrap past its last row, which is never justified"
+    );
+
+    // The press the two layouts disagree about most: on a row that is not the
+    // last, where justification has moved the words furthest.
+    let (point, drawn, if_ragged) = (0..rows - 1)
+        .flat_map(|r| (0..span).map(move |x| Point::new(x as f32, (r as f32 + 0.5) * row)))
+        .filter_map(|at| {
+            Some((
+                at,
+                justified.hit_test(at)?.cursor(),
+                ragged.hit_test(at)?.cursor(),
+            ))
+        })
+        .max_by_key(|&(_, drawn, if_ragged)| drawn.abs_diff(if_ragged))
+        .expect("a press inside the paragraph");
+
+    assert!(
+        drawn.abs_diff(if_ragged) > 2,
+        "no press tells the two layouts apart: both put character {drawn} under it"
+    );
+
+    let origin = harness.text_origin(2);
+    harness.click_at(origin + Vector::new(point.x, point.y));
+
+    // The paragraph is one plain source line, so the character pressed is the
+    // column the caret belongs in.
+    assert_eq!(
+        harness.editor.cursor_position(),
+        (2, drawn),
+        "the caret went to character {if_ragged}, where the text would be were \
+         it not justified"
+    );
+}
+
 /// A line too long for the window wraps; the arrows walk its rows before
 /// leaving it — and entering it from below lands on its last row, not its
 /// first.

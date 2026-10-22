@@ -245,14 +245,19 @@ impl<'a> Viewer<'a> {
         }
     }
 
-    /// Make `content`, which draws `spans` at `size`, report presses on it
-    /// as the block's next piece of text.
+    /// The rendered text of `spans`, drawn at `size` in `font` and aligned by
+    /// `align`, reporting presses on it as the block's next piece of text.
+    ///
+    /// The one place a piece of text's layout is decided: [`Located`] has to
+    /// hit-test a press against the very same layout to land it on the
+    /// character under the pointer, so it is handed the same four values the
+    /// `rich_text` is built from rather than being told them a second time.
     fn located(
         &self,
-        content: impl Into<Element<'a, Uri>>,
         spans: Arc<[Span<'static, Uri>]>,
         size: Pixels,
         font: Option<Font>,
+        align: core_text::Alignment,
     ) -> Element<'a, Uri> {
         let item = self.text_items.get();
         self.text_items.set(item + 1);
@@ -262,12 +267,21 @@ impl<'a> Viewer<'a> {
             .borrow_mut()
             .push(spans.iter().map(|span| span.text.as_ref()).collect());
 
+        let text = rich_text(spans.clone())
+            .on_link_click(Self::on_link_click)
+            .size(size)
+            .align_x(align);
+
         Located {
-            content: content.into(),
+            content: match font {
+                Some(font) => text.font(font).into(),
+                None => text.into(),
+            },
             item,
             spans,
             size,
             font,
+            align,
             hits: self.hits,
         }
         .into()
@@ -449,18 +463,11 @@ impl<'a> markdown::Viewer<'a, Uri> for Viewer<'a> {
             0.0
         };
 
-        container(
-            self.located(
-                rich_text(spans.clone())
-                    .on_link_click(Self::on_link_click)
-                    .size(size),
-                spans,
-                size,
-                None,
-            ),
-        )
-        .padding(padding::top(top))
-        .into()
+        // A title is set, not justified: there is nothing to gain from
+        // stretching the rows of one that happens to wrap.
+        container(self.located(spans, size, None, core_text::Alignment::Default))
+            .padding(padding::top(top))
+            .into()
     }
 
     fn paragraph(&self, settings: markdown::Settings, text: &markdown::Text) -> Element<'a, Uri> {
@@ -489,18 +496,28 @@ impl<'a> markdown::Viewer<'a, Uri> for Viewer<'a> {
             .into()
         } else {
             let spans: Arc<[_]> = self.body(&text.spans(settings.style)).into();
-            let paragraph = rich_text(spans.clone())
-                .on_link_click(Self::on_link_click)
-                .size(settings.text_size);
 
             // Table cells are not numbered: `source_map` does not count the
             // text inside tables, and every piece after it must keep the
-            // number it has there.
+            // number it has there. They are not justified either — a cell is
+            // laid out to its own content, so there is no column edge to
+            // stretch its rows to.
             if self.in_table.get() {
-                return paragraph.into();
+                return rich_text(spans)
+                    .on_link_click(Self::on_link_click)
+                    .size(settings.text_size)
+                    .into();
             }
 
-            self.located(paragraph, spans, settings.text_size, None)
+            // Prose is justified: a paragraph long enough to wrap reads as a
+            // block of text, flush on both sides, rather than trailing off
+            // raggedly on the right.
+            self.located(
+                spans,
+                settings.text_size,
+                None,
+                core_text::Alignment::Justified,
+            )
         }
     }
 
@@ -521,16 +538,15 @@ impl<'a> markdown::Viewer<'a, Uri> for Viewer<'a> {
             .highlighted(code, language, self.code_theme);
 
         // Each line is a piece of text of its own, in the order the source
-        // map numbers them.
+        // map numbers them. Code is laid out as written — it does not wrap
+        // (the block scrolls sideways instead), and its columns have to line
+        // up character for character.
         let rows = lines.iter().cloned().map(|spans| {
             self.located(
-                rich_text(spans.clone())
-                    .on_link_click(Self::on_link_click)
-                    .font(Font::MONOSPACE)
-                    .size(settings.code_size),
                 spans,
                 settings.code_size,
                 Some(Font::MONOSPACE),
+                core_text::Alignment::Default,
             )
         });
 
@@ -819,11 +835,13 @@ fn build_cell_element(
 
 /// Rendered text that knows where a press on it landed.
 ///
-/// Wraps the `rich_text` of a heading, a paragraph or a line of code. A press
-/// over it is hit-tested against the same spans, laid out at the same bounds
-/// and size as the `rich_text` laid them out — so it lands on exactly the
-/// character under the pointer — and recorded, as a [`TextHit`], in the slot
-/// the block's `document::Hit` reads once the press has been handled.
+/// Wraps the `rich_text` of a heading, a paragraph or a line of code — built
+/// by [`Viewer::located`], which hands it the same spans, size, font and
+/// alignment. A press over it is hit-tested against a paragraph laid out from
+/// those, at the same bounds the `rich_text` laid its own out at — so it lands
+/// on exactly the character under the pointer, justified prose included — and
+/// recorded, as a [`TextHit`], in the slot the block's `document::Hit` reads
+/// once the press has been handled.
 ///
 /// `item` numbers the text within its block in drawing order, the order
 /// [`crate::source_map`] numbers it in to map it back to the source.
@@ -833,6 +851,7 @@ struct Located<'a> {
     spans: Arc<[Span<'static, Uri>]>,
     size: Pixels,
     font: Option<Font>,
+    align: core_text::Alignment,
     hits: &'a TextHits,
 }
 
@@ -933,7 +952,7 @@ impl Widget<Uri, Theme, Renderer> for Located<'_> {
             font: self
                 .font
                 .unwrap_or_else(|| core_text::Renderer::default_font(renderer)),
-            align_x: core_text::Alignment::Default,
+            align_x: self.align,
             align_y: alignment::Vertical::Top,
             shaping: core_text::Shaping::Advanced,
             wrapping: core_text::Wrapping::default(),

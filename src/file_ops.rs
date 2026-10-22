@@ -46,18 +46,27 @@ pub async fn load_file(path: impl Into<PathBuf>) -> Result<(PathBuf, Arc<String>
 /// The dialog lets the user browse folders and pick any file, with
 /// convenience filters for Markdown, Text and All Files.
 ///
+/// `starting_directory` is where the chooser opens. With none set, GTK shows
+/// its "Recent files" list instead of a folder, which is both slower to build
+/// and nowhere near the document being edited.
+///
 /// This function is designed to be called via
 /// `window::run(id, open_file_dialog)` so the runtime provides the window
 /// handle.
 pub fn open_file_dialog(
     window: &dyn Window,
+    starting_directory: Option<PathBuf>,
 ) -> impl Future<Output = Result<(PathBuf, Arc<String>), FileError>> + use<> {
-    let dialog = rfd::AsyncFileDialog::new()
+    let mut dialog = rfd::AsyncFileDialog::new()
         .set_title("Open file")
         .add_filter("Markdown", &["md", "markdown"])
         .add_filter("Text", &["txt"])
         .add_filter("All Files", &["*"])
         .set_parent(&window);
+
+    if let Some(directory) = starting_directory {
+        dialog = dialog.set_directory(directory);
+    }
 
     async move {
         let handle = dialog.pick_file().await.ok_or(FileError::DialogClosed)?;
